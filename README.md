@@ -1,3 +1,95 @@
+
+def mark_suspicious_records(spark, config):
+    """
+    Marks individual records as potentially problematic based on their participation 
+    in unusual sensor transitions.
+    """
+    window_spec = Window.partitionBy("lpr_number").orderBy("spott_date")
+    
+    # First, calculate transition statistics
+    transitions_df = (
+        spark.table(config.TABLE_3)
+        .withColumn("prev_sensor", F.lag("sensor_code", 1).over(window_spec))
+        .filter(
+            (F.col("prev_sensor").isNotNull()) &
+            (F.col("prev_sensor") != F.col("sensor_code"))
+        )
+    )
+    
+    # Calculate transition rates
+    pairs_df = (
+        transitions_df
+        .groupBy("sensor_code", "prev_sensor")
+        .agg(F.count("*").alias("pairs_count"))
+    )
+    
+    single_df = (
+        transitions_df
+        .groupBy("sensor_code")
+        .agg(F.count("*").alias("total_count"))
+    )
+    
+    stats_df = (
+        single_df.join(pairs_df, "sensor_code")
+        .withColumn("transition_rate", 
+            F.col("pairs_count") / F.col("total_count"))
+    )
+    
+    percentile_90 = stats_df.approxQuantile("transition_rate", [0.9], relativeError=0.05)[0]
+    
+    # Mark transitions
+    marked_transitions = (
+        stats_df
+        .withColumn("percentile_90", F.lit(percentile_90))
+        .withColumn(
+            "transition_score",
+            F.when(
+                F.col("transition_rate") < F.col("percentile_90"),
+                F.col("transition_rate") / F.col("percentile_90")  # Score between 0 and 1
+            ).otherwise(1.0)
+        )
+    )
+    
+    # Apply scores back to original records
+    result_df = (
+        spark.table(config.TABLE_3)
+        .withColumn("prev_sensor", F.lag("sensor_code", 1).over(window_spec))
+        # Join with transition scores
+        .join(
+            marked_transitions,
+            ["sensor_code", "prev_sensor"],
+            "left"
+        )
+        # Handle first reading of each plate (no previous sensor)
+        .withColumn(
+            "transition_score",
+            F.coalesce(F.col("transition_score"), F.lit(1.0))
+        )
+        # Calculate running average score for each plate
+        .withColumn(
+            "avg_score",
+            F.avg("transition_score").over(
+                Window.partitionBy("lpr_number")
+                      .orderBy("spott_date")
+                      .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+            )
+        )
+        # Mark records as suspicious based on scores
+        .withColumn(
+            "is_suspicious",
+            F.when(
+                (F.col("transition_score") < 0.5) |  # Current transition is very unusual
+                (F.col("avg_score") < 0.7),          # Overall pattern is unusual
+                True
+            ).otherwise(False)
+        )
+    )
+    
+    return result_df
+
+
+
+
 def detect_duplicate_plates(spark, config):
     """
     Detects potentially duplicated license plates by identifying physically impossible patterns
