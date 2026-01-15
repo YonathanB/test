@@ -1,94 +1,94 @@
 # ============================================================
-# END-TO-END PySpark (INCRÉMENTAL, SANS DELTA)
-# - Stockage Hadoop/Hive Parquet/ORC classique
-# - Upsert via "bucket overwrite" (partition par bucket) pour éviter de réécrire toute la table
-#
+# PYSPARK PIPELINE (Hive + Metastore, sans Delta)
 # Objectif:
-#   1) Déduire une position robuste des routeurs à partir de points GPS de mobiles
-#   2) Déduire une position des caméras via camera -> ip_best -> router_state
-#   3) Maintenir ces résultats quotidiennement (incremental daily)
+# 1) Localiser des ROUTEURS (ou "points d'accès réseau") à partir de (wifi_event + gps)
+# 2) Créer un identifiant "router_id" STABLE basé sur la géographie (pas sur l'IP)
+# 3) Associer les CAMERAS à un router_id (par proximité géographique des IP observées)
+# 4) Localiser les CAMERAS et détecter les CAMERAS MOBILES (instabilité spatiale)
+# 5) Tout faire INCREMENTAL quotidien, sans "read & overwrite same table"
 #
-# Important:
-# - Adapte les noms de tables/colonnes dans CONFIG à ton schéma réel.
-# - Toutes les tables "gold state" sont partitionnées par 'bucket' (int) pour permettre l'overwrite ciblé.
-# - Toutes les tables "gold daily" sont partitionnées par 'day' (string yyyy-MM-dd) en append-only.
+# Hypothèses sur tes sources:
+# - raw.wifi(day, device_id, router_ip, wifi_ts)
+# - raw.gps (day, device_id, ts, lat, lon)
+# - raw.comm(day, camera_id, ip, ts)  # "camera -> ip vue" (énorme, partitionnée par day)
+#
+# Notes:
+# - On n'utilise PAS une "ip_best sur 30 jours" comme vérité.
+#   L'IP est un tremplin: on calcule d'abord la position des IP (ip_state),
+#   puis on mappe les IP vers un router_id géographique stable.
+# - On écrit des tables DAILY (append) + tables STATE (upsert par bucket via staging+insert overwrite)
 # ============================================================
 
 from pyspark.sql import functions as F
 from pyspark.sql import Window
+import uuid
 
-# ============================================================
-# CONFIG — ADAPTE ICI
-# ============================================================
-CONFIG = {
-    # RAW tables (partitionnées par 'day' idéalement)
-    # COMM: énorme table communications caméras -> backend
-    "COMM_RAW_TABLE": "raw.comm",                 # day, camera_id, ip, ts
-    # GPS: positions GPS de mobiles (device) à différents timestamps
-    "GPS_RAW_TABLE": "raw.gps",                   # day, device_id, ts, lat, lon
-    # WIFI: évènements de connexion device -> routeur (via IP routeur)
-    "WIFI_RAW_TABLE": "raw.wifi",                 # day, device_id, router_ip, wifi_ts
+# ------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------
+CFG = {
+    "COMM_RAW": "raw.comm",
+    "GPS_RAW":  "raw.gps",
+    "WIFI_RAW": "raw.wifi",
 
-    # GOLD (daily append-only)
-    "COMM_DAILY_TABLE": "gold.comm_daily",        # partition day
-    "SEGMENT_DAILY_TABLE": "gold.segments_daily", # partition day
-    "MATCHES_DAILY_TABLE": "gold.matches_daily",  # partition day
-    "ROUTER_DAILY_TABLE": "gold.router_daily",    # partition day
+    # daily (append)
+    "COMM_DAILY":    "gold.comm_daily",
+    "MATCH_DAILY":   "gold.match_daily",     # wifi->pos
+    "IP_DAILY":      "gold.ip_daily",        # ip->pos daily (agrégé)
+    "ROUTER_DAILY":  "gold.router_daily",    # router_id->pos daily
+    "CAM_DAILY":     "gold.camera_daily",    # camera->pos daily
+    "MOB_DAILY":     "gold.camera_mobility_daily",
 
-    # GOLD (state upsert via bucket overwrite)
-    "DEVICE_STATE_TABLE": "gold.device_state",    # partition bucket
-    "ROUTER_STATE_TABLE": "gold.router_state",    # partition bucket
-    "CAMERA_IP_STATE_TABLE": "gold.camera_ip_state",  # partition bucket
-    "CAMERA_MASTER_TABLE": "gold.camera_master",      # partition bucket
+    # state (upsert by bucket)
+    "DEVICE_STATE":  "gold.device_state",    # optionnel (seed segmentation)
+    "IP_STATE":      "gold.ip_state",        # ip -> lat/lon stable + confidence + router_id
+    "ROUTER_STATE":  "gold.router_state",    # router_id -> lat/lon stable + confidence
+    "CAM_MASTER":    "gold.camera_master",   # camera_id -> lat/lon stable + confidence + router_id
+    "CAM_MOB_STATE": "gold.camera_mobility_state",  # camera_id -> mobility score + flags
 
-    # Filtre géographique grossier (évite des points absurdes) - adapte à ton pays
-    "COUNTRY_BBOX": {"min_lat": 29.0, "max_lat": 34.0, "min_lon": 34.0, "max_lon": 36.5},
-
-    # Bucketing pour l'upsert (choisis 128/256/512 selon volume)
     "BUCKETS": 256,
 }
 
-# ============================================================
-# PARAMS — Ajustables
-# ============================================================
-PARAMS = {
-    # Segmentation GPS (détecter des "fragments stables")
-    "SEG_RADIUS_M": 100.0,             # si distance entre points successifs > 100m => nouveau segment
-    "SEG_MAX_GAP_MIN": 60,             # si trou temporel > 60min => nouveau segment
-    "SEG_MIN_POINTS": 3,               # segment stable doit avoir >= 3 points
-    "SEG_MIN_DURATION_MIN": 30,        # et durer >= 30min
-    "SEG_WIFI_BUFFER_MIN": 10,         # on accepte wifi_ts dans [start-buffer, end+buffer]
+P = {
+    # Matching wifi<->gps
+    "STRICT_MIN": 5,            # ±5 min
+    "WIDE_MIN": 60,             # fallback window ±60 min (mais on exige K points cohérents)
 
-    # Matching strict (join Wi-Fi -> point GPS)
-    "STRICT_JOIN_MIN": 5,              # ±5min
+    # "preuve" minimum si pas de point strict
+    "MIN_POINTS_WIDE": 5,
+    "MAX_RADIUS_M": 80.0,       # points cohérents dans un rayon ~80m
+    "MIN_SPAN_MIN": 30,         # ces points doivent couvrir au moins 30 min (stabilité temporelle)
 
-    # Agrégation routeur robuste (outliers)
-    "OUTLIER_PCTL": 0.95,              # on garde les points jusqu'au 95e percentile des distances
-    "MAX_OUTLIER_M": 1500.0,           # plafond hard: > 1500m = rejet
-    "TAU_RECENCY_DAYS": 14.0,          # décroissance récence dans les poids
+    # IP / Router aggregation
+    "OUTLIER_PCTL": 0.95,
+    "MAX_OUTLIER_M": 1500.0,
+    "TAU_REC_DAYS": 14.0,
 
-    # Hystérésis (stabilité jour à jour)
-    "HYST_DELTA": 8,                   # on switch si new_conf >= old_conf + 8
-    "JUMP_SUSPECT_M": 15000.0,         # jump > 15km => très suspect
-    "STALE_DAYS": 21,                  # si prev trop vieux => on accepte switch
+    # Router geo-id
+    "ROUTER_CELL_M": 150.0,     # taille cellule (en mètres) pour créer un router_id stable
+                                # (plus petit = plus précis mais plus de routeurs distincts)
 
-    # Camera ip_best (fenêtre exacte sur comm_daily)
-    "IP_WINDOW_DAYS": 30,
+    # Hysteresis
+    "HYST_DELTA": 8,
+    "JUMP_SUSPECT_M": 15000.0,
+    "STALE_DAYS": 21,
+
+    # Camera association
+    "CAM_LINK_MAX_DIST_M": 250.0,   # si IP vue pour la caméra tombe près d'un router_id (<=250m)
+    "CAM_LINK_MIN_HITS": 3,         # min d'observations pour accepter le lien camera->router_id
+
+    # Mobility detection
+    "MOB_WIN_DAYS": 14,             # fenêtre d'analyse mobilité
+    "MOB_MIN_OBS": 6,
+    "MOB_JUMP_M": 2000.0,           # sauts > 2km
+    "MOB_SWITCH_ZONES": 4,          # nb de zones distinctes (router_id) élevé
+    "MOB_SCORE_TH": 70,             # score >= 70 => mobile probable
 }
 
-# ============================================================
-# UTILS
-# ============================================================
-def in_bbox(lat_col, lon_col, bbox):
-    """Filtre grossier pour garder les points dans le pays."""
-    return (
-        lat_col.isNotNull() & lon_col.isNotNull() &
-        lat_col.between(bbox["min_lat"], bbox["max_lat"]) &
-        lon_col.between(bbox["min_lon"], bbox["max_lon"])
-    )
-
+# ------------------------------------------------------------
+# UTILS (distance, weights, bucketing, safe upsert Hive)
+# ------------------------------------------------------------
 def haversine_m(lat1, lon1, lat2, lon2):
-    """Distance Haversine en mètres (sans UDF)."""
     R = F.lit(6371000.0)
     dlat = F.radians(lat2 - lat1)
     dlon = F.radians(lon2 - lon1)
@@ -96,412 +96,412 @@ def haversine_m(lat1, lon1, lat2, lon2):
     c = 2 * F.atan2(F.sqrt(a), F.sqrt(1 - a))
     return R * c
 
-def exp_decay_days(age_days_col, tau):
-    """Poids de récence : exp(-age/tau). Plus c'est récent, plus le poids est fort."""
-    return F.exp(-age_days_col / F.lit(tau))
+def exp_decay_days(age_days_col, tau_days):
+    return F.exp(-age_days_col / F.lit(float(tau_days)))
 
 def add_bucket(df, key_col, buckets):
-    """
-    Ajoute une colonne 'bucket' stable à partir de la clé.
-    On pourra overwrite uniquement ces partitions bucket.
-    """
-    return df.withColumn("bucket", F.pmod(F.xxhash64(F.col(key_col)), F.lit(buckets)).cast("int"))
+    h = F.xxhash64(F.col(key_col))
+    h_pos = F.when(h < 0, -h - 1).otherwise(h)
+    return df.withColumn("bucket", (h_pos % F.lit(int(buckets))).cast("int"))
 
-# ============================================================
-# UPSERT SANS DELTA: BUCKET OVERWRITE
-# ============================================================
-def ensure_bucketed_table_exists(spark, table_name, schema_df):
-    """
-    Optionnel: crée la table si elle n'existe pas (schema minimal).
-    Dans beaucoup de setups, tu créeras les tables en amont (Hive DDL).
-    """
+def ensure_table_exists_like(spark, table_name, df_with_bucket):
     try:
         spark.table(table_name).limit(1).collect()
     except Exception:
-        # créer une table vide partitionnée par bucket
-        empty = schema_df.limit(0)
-        (empty.write.mode("overwrite").format("parquet").partitionBy("bucket").saveAsTable(table_name))
+        (df_with_bucket.limit(0)
+         .write.mode("overwrite").format("parquet").partitionBy("bucket").saveAsTable(table_name))
 
-def upsert_bucket_overwrite(spark, target_table, source_df, key_col, buckets):
+def upsert_bucket_hive(spark, target_table, source_df, key_col, buckets):
     """
-    Upsert sans Delta:
-    - Les tables STATE sont partitionnées par bucket.
-    - Chaque run: on ne met à jour que les buckets impactés par source_df.
-    - On lit le contenu existant de ces buckets, union, puis on garde la dernière version par key.
-    - Puis overwrite des partitions impactées uniquement.
+    Upsert Hive-safe:
+    - calc buckets impactés
+    - union existing buckets + source
+    - latest-wins via last_update_ts
+    - write staging table
+    - INSERT OVERWRITE TABLE target PARTITION(bucket) for impacted buckets
     """
-    src_b = add_bucket(source_df, key_col, buckets)
+    spark.sql("SET hive.exec.dynamic.partition=true")
+    spark.sql("SET hive.exec.dynamic.partition.mode=nonstrict")
+    spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
-    # Buckets impactés aujourd'hui. En général: petit nombre.
+    src_b = add_bucket(source_df, key_col, buckets).persist()
+
     impacted = [r["bucket"] for r in src_b.select("bucket").distinct().collect()]
+    if not impacted:
+        src_b.unpersist()
+        return
 
-    # Lire les buckets impactés existants (si table existe)
+    impacted_sql = ",".join(str(b) for b in impacted)
+
     try:
-        tgt = spark.table(target_table).where(F.col("bucket").isin(impacted))
+        tgt_b = spark.table(target_table).where(F.col("bucket").isin(impacted))
+        all_b = tgt_b.unionByName(src_b, allowMissingColumns=True)
     except Exception:
-        tgt = None
+        all_b = src_b
 
-    if tgt is None:
-        final_b = src_b
-    else:
-        # Union existant + nouveau, puis dédoublonnage par key (dernière maj gagne)
-        all_b = tgt.unionByName(src_b, allowMissingColumns=True)
+    if "last_update_ts" not in all_b.columns:
+        raise ValueError("upsert_bucket_hive: colonne last_update_ts obligatoire.")
 
-        # IMPORTANT: il faut un champ "last_update_ts" pour choisir la version la plus récente
-        w = Window.partitionBy(key_col).orderBy(F.col("last_update_ts").desc_nulls_last())
-        final_b = all_b.withColumn("rn", F.row_number().over(w)).where(F.col("rn")==1).drop("rn")
+    w = Window.partitionBy(key_col).orderBy(F.col("last_update_ts").desc_nulls_last())
+    final_b = (all_b.withColumn("rn", F.row_number().over(w))
+                    .where(F.col("rn") == 1).drop("rn"))
 
-    # Overwrite uniquement les partitions bucket impactées.
-    # (Spark overwrite partition-by-partition quand on écrit avec partitionBy et mode overwrite)
-    (final_b
-     .write
-     .mode("overwrite")
-     .format("parquet")
-     .partitionBy("bucket")
-     .saveAsTable(target_table))
+    staging = f"{target_table}__stg__{uuid.uuid4().hex[:8]}"
+    (final_b.write.mode("overwrite").format("parquet").partitionBy("bucket").saveAsTable(staging))
 
-# ============================================================
-# STEP 1 — COMM_DAILY (compression de la comm raw)
-# Pourquoi?
-# - La table raw comm est énorme.
-# - On crée un résumé quotidien (beaucoup plus petit) pour calculer ip_best sur 30 jours
-# ============================================================
-def build_comm_daily(spark, day):
-    comm = (spark.table(CONFIG["COMM_RAW_TABLE"])
-            .where(F.col("day")==F.lit(day))
-            .where(F.col("camera_id").isNotNull() & F.col("ip").isNotNull() & F.col("ts").isNotNull())
+    non_part_cols = [c for c in final_b.columns if c != "bucket"]
+    select_cols_sql = ", ".join(non_part_cols + ["bucket"])
+
+    spark.sql(f"""
+        INSERT OVERWRITE TABLE {target_table} PARTITION (bucket)
+        SELECT {select_cols_sql}
+        FROM {staging}
+        WHERE bucket IN ({impacted_sql})
+    """)
+    spark.sql(f"DROP TABLE {staging}")
+    src_b.unpersist()
+
+
+# ------------------------------------------------------------
+# STEP 1 — COMM_DAILY: compresser raw.comm (énorme)
+# But:
+# - réduire la volumétrie
+# - garder camera_id <-> ip avec stats du jour
+# ------------------------------------------------------------
+def step1_comm_daily(spark, day):
+    comm = (spark.table(CFG["COMM_RAW"])
+            .where(F.col("day") == F.lit(day))
+            .where("camera_id is not null and ip is not null and ts is not null")
             .select("camera_id", "ip", "ts"))
 
-    # Pour chaque camera_id/ip: combien de messages aujourd'hui + dernier timestamp
     comm_daily = (comm.groupBy("camera_id", "ip")
                   .agg(F.count("*").alias("obs_count"),
                        F.max("ts").alias("last_ts"))
                   .withColumn("day", F.lit(day)))
 
-    (comm_daily.write.mode("append").format("parquet").partitionBy("day").saveAsTable(CONFIG["COMM_DAILY_TABLE"]))
+    (comm_daily.write.mode("append").format("parquet").partitionBy("day").saveAsTable(CFG["COMM_DAILY"]))
     return comm_daily
 
-# ============================================================
-# STEP 2 — GPS SEGMENTS (incremental)
-# Idée:
-# - Les GPS sont "sparse". On regroupe en segments stables.
-# - Incrémental: pour device_id, on réutilise le dernier point d'hier comme seed.
-# - On met à jour device_state (last point + last segment_id) pour continuer proprement demain.
-# ============================================================
-def build_segments_incremental(spark, day):
-    gps_d = (spark.table(CONFIG["GPS_RAW_TABLE"])
-             .where(F.col("day")==F.lit(day))
-             .where(F.col("device_id").isNotNull() & F.col("ts").isNotNull()
-                    & F.col("lat").isNotNull() & F.col("lon").isNotNull())
-             .select("device_id",
-                     F.col("ts").alias("ts"),
-                     F.col("lat").cast("double").alias("lat"),
-                     F.col("lon").cast("double").alias("lon")))
 
-    affected_devices = gps_d.select("device_id").distinct()
+# ------------------------------------------------------------
+# STEP 2 — MATCH_DAILY: wifi->position (logique "preuve")
+# But:
+# - Pour chaque event wifi(device_id, router_ip, wifi_ts), produire un point (lat,lon) SI fiable.
+# Règle:
+# - Si un point GPS existe à ±5min => OK (strict)
+# - Sinon, on accepte UNIQUEMENT si on a >=K points GPS dans ±WIDE_MIN,
+#   cohérents spatialement (rayon <= MAX_RADIUS_M) et couvrant >= MIN_SPAN_MIN.
+# ------------------------------------------------------------
+def step2_match_daily(spark, day):
+    wifi = (spark.table(CFG["WIFI_RAW"])
+            .where(F.col("day") == F.lit(day))
+            .where("device_id is not null and router_ip is not null and wifi_ts is not null")
+            .select("device_id", F.col("router_ip").alias("ip"), F.col("wifi_ts").alias("wifi_ts")))
 
-    # Etat précédent des devices: dernier point GPS connu + dernier segment_id
-    try:
-        device_state_prev = (spark.table(CONFIG["DEVICE_STATE_TABLE"])
-                             .join(affected_devices, "device_id", "inner")
-                             .select("device_id", "last_ts", "last_lat", "last_lon", "last_segment_id"))
-    except Exception:
-        device_state_prev = spark.createDataFrame([], """
-            device_id string, last_ts timestamp, last_lat double, last_lon double, last_segment_id long
-        """)
+    gps = (spark.table(CFG["GPS_RAW"])
+           .where(F.col("day") == F.lit(day))
+           .where("device_id is not null and ts is not null and lat is not null and lon is not null")
+           .select("device_id", F.col("ts").alias("gps_ts"),
+                   F.col("lat").cast("double").alias("lat"),
+                   F.col("lon").cast("double").alias("lon")))
 
-    # Seed: dernier point connu (pour ne pas casser un segment à minuit)
-    seed = (device_state_prev
-            .where(F.col("last_ts").isNotNull())
-            .select(
-                "device_id",
-                F.col("last_ts").alias("ts"),
-                F.col("last_lat").alias("lat"),
-                F.col("last_lon").alias("lon"),
-                F.lit(True).alias("is_seed"),
-                F.coalesce(F.col("last_segment_id"), F.lit(0)).alias("seg_offset")
-            ))
-
-    gps_d2 = gps_d.withColumn("is_seed", F.lit(False)).withColumn("seg_offset", F.lit(0))
-    gps_all = seed.unionByName(gps_d2, allowMissingColumns=True)
-
-    # Ordonner les points par device/ts et décider quand un nouveau segment commence
-    w = Window.partitionBy("device_id").orderBy("ts")
-    seg = (gps_all
-           .withColumn("prev_ts",  F.lag("ts").over(w))
-           .withColumn("prev_lat", F.lag("lat").over(w))
-           .withColumn("prev_lon", F.lag("lon").over(w))
-           .withColumn("gap_min", (F.unix_timestamp("ts") - F.unix_timestamp("prev_ts"))/60.0)
-           .withColumn("d_prev_m", haversine_m(F.col("prev_lat"), F.col("prev_lon"), F.col("lat"), F.col("lon")))
-           .withColumn(
-               "new_segment",
-               F.when(F.col("prev_ts").isNull(), F.lit(1))  # premier point
-                .when(F.col("gap_min") > F.lit(PARAMS["SEG_MAX_GAP_MIN"]), F.lit(1))  # trou temporel
-                .when(F.col("d_prev_m") > F.lit(PARAMS["SEG_RADIUS_M"]), F.lit(1))    # saut spatial
-                .otherwise(F.lit(0))
-           )
-           # segment local = cumul new_segment
-           .withColumn("segment_local", F.sum("new_segment").over(w))
-           # segment global = segment_local + offset (pour continuer après minuit)
-           .withColumn("segment_id", F.col("segment_local") + F.max("seg_offset").over(Window.partitionBy("device_id")))
-           .drop("segment_local")
-          )
-
-    # Agrégation segment: centroid + durée + nb points
-    seg0 = (seg.groupBy("device_id", "segment_id")
-            .agg(F.min("ts").alias("seg_start_ts"),
-                 F.max("ts").alias("seg_end_ts"),
-                 F.count("*").alias("seg_points"),
-                 F.avg("lat").alias("seg_lat"),
-                 F.avg("lon").alias("seg_lon"))
-            .withColumn("seg_duration_min",
-                        (F.unix_timestamp("seg_end_ts")-F.unix_timestamp("seg_start_ts"))/60.0))
-
-    # Mesure dispersion du segment: distance max des points au centroid
-    seg_with_centroid = (seg.join(seg0.select("device_id","segment_id","seg_lat","seg_lon"),
-                                  ["device_id","segment_id"], "left")
-                           .withColumn("d_to_centroid_m",
-                                       haversine_m(F.col("seg_lat"),F.col("seg_lon"),F.col("lat"),F.col("lon"))))
-
-    disp = (seg_with_centroid.groupBy("device_id","segment_id")
-            .agg(F.max("d_to_centroid_m").alias("seg_max_dist_m"),
-                 F.expr("percentile_approx(d_to_centroid_m, 0.95)").alias("seg_p95_dist_m")))
-
-    segments = (seg0.join(disp, ["device_id","segment_id"], "left")
-                .withColumn("is_stable",
-                            (F.col("seg_points")>=F.lit(PARAMS["SEG_MIN_POINTS"])) &
-                            (F.col("seg_duration_min")>=F.lit(PARAMS["SEG_MIN_DURATION_MIN"])) &
-                            (F.col("seg_max_dist_m")<=F.lit(PARAMS["SEG_RADIUS_M"])))
-                .withColumn("day", F.lit(day)))
-
-    # On écrit les segments du jour en append (table daily)
-    (segments.write.mode("append").format("parquet").partitionBy("day").saveAsTable(CONFIG["SEGMENT_DAILY_TABLE"]))
-
-    # Mise à jour device_state: dernier point non-seed du jour
-    last_point = (seg.where(F.col("is_seed")==F.lit(False))
-                  .withColumn("rn", F.row_number().over(Window.partitionBy("device_id").orderBy(F.col("ts").desc())))
-                  .where(F.col("rn")==1)
-                  .select("device_id",
-                          F.col("ts").alias("last_ts"),
-                          F.col("lat").alias("last_lat"),
-                          F.col("lon").alias("last_lon"),
-                          F.col("segment_id").alias("last_segment_id"))
-                 )
-
-    device_state_new = last_point.withColumn("last_update_ts", F.current_timestamp())
-    ensure_bucketed_table_exists(spark, CONFIG["DEVICE_STATE_TABLE"], add_bucket(device_state_new, "device_id", CONFIG["BUCKETS"]))
-    upsert_bucket_overwrite(spark, CONFIG["DEVICE_STATE_TABLE"], device_state_new, "device_id", CONFIG["BUCKETS"])
-
-    return segments
-
-# ============================================================
-# STEP 3 — MATCHES DAILY (wifi -> position)
-# Priorité:
-#   1) strict (wifi_ts proche d'un point gps)
-#   2) sinon segment stable (wifi_ts dans l'intervalle d'un segment stable ± buffer)
-# ============================================================
-def build_matches_daily(spark, day):
-    wifi_d = (spark.table(CONFIG["WIFI_RAW_TABLE"])
-              .where(F.col("day")==F.lit(day))
-              .where(F.col("device_id").isNotNull() & F.col("router_ip").isNotNull() & F.col("wifi_ts").isNotNull())
-              .select("device_id", F.col("router_ip").alias("router_ip"), F.col("wifi_ts").alias("wifi_ts")))
-
-    gps_d = (spark.table(CONFIG["GPS_RAW_TABLE"])
-             .where(F.col("day")==F.lit(day))
-             .where(F.col("device_id").isNotNull() & F.col("ts").isNotNull()
-                    & F.col("lat").isNotNull() & F.col("lon").isNotNull())
-             .select("device_id",
-                     F.col("ts").alias("ts"),
-                     F.col("lat").cast("double").alias("lat"),
-                     F.col("lon").cast("double").alias("lon")))
-
-    # ---- (1) strict join ±STRICT_JOIN_MIN
-    strict_expr = f"INTERVAL {PARAMS['STRICT_JOIN_MIN']} MINUTES"
-    strict = (wifi_d.alias("w")
-              .join(gps_d.alias("g"),
-                    (F.col("w.device_id")==F.col("g.device_id")) &
-                    (F.col("g.ts").between(F.col("w.wifi_ts")-F.expr(strict_expr),
-                                           F.col("w.wifi_ts")+F.expr(strict_expr))),
+    # ---- STRICT join ±5 minutes => choisir le gps le plus proche
+    strict_iv = f"INTERVAL {int(P['STRICT_MIN'])} MINUTES"
+    strict = (wifi.alias("w")
+              .join(gps.alias("g"),
+                    (F.col("w.device_id") == F.col("g.device_id")) &
+                    (F.col("g.gps_ts").between(F.col("w.wifi_ts") - F.expr(strict_iv),
+                                               F.col("w.wifi_ts") + F.expr(strict_iv))),
                     "left")
-              .withColumn("dt_sec", F.abs(F.unix_timestamp("w.wifi_ts")-F.unix_timestamp("g.ts"))))
+              .withColumn("dt_sec", F.abs(F.unix_timestamp("w.wifi_ts") - F.unix_timestamp("g.gps_ts"))))
 
-    w_pick = Window.partitionBy("w.device_id","w.router_ip","w.wifi_ts").orderBy(F.col("dt_sec").asc_nulls_last(), F.col("g.ts").desc_nulls_last())
+    w_pick = Window.partitionBy("w.device_id", "w.ip", "w.wifi_ts").orderBy(F.col("dt_sec").asc_nulls_last())
     best_strict = (strict.withColumn("rn", F.row_number().over(w_pick))
-                        .where(F.col("rn")==1).drop("rn")
-                        .withColumn("match_type", F.when(F.col("g.ts").isNotNull(), F.lit("strict")).otherwise(F.lit(None)))
+                        .where(F.col("rn") == 1).drop("rn")
                         .select(
                             F.col("w.device_id").alias("device_id"),
-                            F.col("w.router_ip").alias("router_ip"),
+                            F.col("w.ip").alias("ip"),
                             F.col("w.wifi_ts").alias("wifi_ts"),
-                            F.col("g.lat").alias("lat"),
-                            F.col("g.lon").alias("lon"),
-                            "match_type",
-                            F.col("dt_sec").alias("dt_sec")
+                            F.col("g.lat").alias("lat_strict"),
+                            F.col("g.lon").alias("lon_strict"),
+                            F.col("dt_sec").alias("strict_dt_sec")
                         ))
 
-    # ---- (2) segment fallback (uniquement quand strict absent)
-    no_strict = best_strict.where(F.col("match_type").isNull()).select("device_id","router_ip","wifi_ts")
+    # ---- WIDE window candidates ±WIDE_MIN (pour seulement ceux sans strict)
+    wide_iv = f"INTERVAL {int(P['WIDE_MIN'])} MINUTES"
+    wide = (best_strict.where(F.col("strict_dt_sec").isNull()).alias("w")
+            .join(gps.alias("g"),
+                  (F.col("w.device_id") == F.col("g.device_id")) &
+                  (F.col("g.gps_ts").between(F.col("w.wifi_ts") - F.expr(wide_iv),
+                                             F.col("w.wifi_ts") + F.expr(wide_iv))),
+                  "left")
+            .select("w.device_id", "w.ip", "w.wifi_ts", "g.gps_ts", "g.lat", "g.lon"))
 
-    seg_d = (spark.table(CONFIG["SEGMENT_DAILY_TABLE"])
-             .where(F.col("day")==F.lit(day))
-             .where(F.col("is_stable")==F.lit(True))
-             .select("device_id","segment_id","seg_lat","seg_lon","seg_start_ts","seg_end_ts","seg_points","seg_max_dist_m"))
+    # S'il n'y a aucun gps dans la fenêtre large => on rejettera de toute façon
+    # On va calculer une "cohérence": centre médian + distances => p95 <= MAX_RADIUS_M, K points, span >= MIN_SPAN_MIN
+    grp = (wide.groupBy("device_id", "ip", "wifi_ts")
+           .agg(
+               F.count("*").alias("k_points"),
+               F.min("gps_ts").alias("min_ts"),
+               F.max("gps_ts").alias("max_ts"),
+               F.expr("percentile_approx(lat, 0.5)").alias("lat_med"),
+               F.expr("percentile_approx(lon, 0.5)").alias("lon_med"),
+               F.collect_list(F.struct("lat", "lon")).alias("pts")  # pour calcul distances via explode
+           ))
 
-    buffer_expr = f"INTERVAL {PARAMS['SEG_WIFI_BUFFER_MIN']} MINUTES"
-    seg_join = (no_strict.alias("w")
-                .join(seg_d.alias("s"),
-                      (F.col("w.device_id")==F.col("s.device_id")) &
-                      (F.col("w.wifi_ts").between(F.col("s.seg_start_ts")-F.expr(buffer_expr),
-                                                  F.col("s.seg_end_ts")+F.expr(buffer_expr))),
-                      "left")
-                # dt_to_seg_sec = distance temporelle au segment (0 si à l'intérieur)
-                .withColumn("dt_to_seg_sec",
-                            F.when(F.col("s.seg_start_ts").isNull(), F.lit(None).cast("long"))
-                             .when(F.col("w.wifi_ts") < F.col("s.seg_start_ts"), F.unix_timestamp("s.seg_start_ts")-F.unix_timestamp("w.wifi_ts"))
-                             .when(F.col("w.wifi_ts") > F.col("s.seg_end_ts"),   F.unix_timestamp("w.wifi_ts")-F.unix_timestamp("s.seg_end_ts"))
-                             .otherwise(F.lit(0))))
+    # Distance p95 au centre (sans UDF)
+    pts_expl = (grp.select("device_id", "ip", "wifi_ts", "k_points", "min_ts", "max_ts", "lat_med", "lon_med",
+                           F.explode_outer("pts").alias("p"))
+                .select("device_id", "ip", "wifi_ts", "k_points", "min_ts", "max_ts", "lat_med", "lon_med",
+                        F.col("p.lat").alias("lat"), F.col("p.lon").alias("lon"))
+                .withColumn("d_m", haversine_m(F.col("lat_med"), F.col("lon_med"), F.col("lat"), F.col("lon"))))
 
-    w_pick_seg = Window.partitionBy("w.device_id","w.router_ip","w.wifi_ts").orderBy(
-        F.col("dt_to_seg_sec").asc_nulls_last(),
-        F.col("s.seg_max_dist_m").asc_nulls_last(),
-        F.col("s.seg_end_ts").desc_nulls_last()
-    )
+    coh = (pts_expl.groupBy("device_id", "ip", "wifi_ts", "k_points", "min_ts", "max_ts", "lat_med", "lon_med")
+           .agg(F.expr("percentile_approx(d_m, 0.95)").alias("p95_m"),
+                F.max("d_m").alias("max_m")))
 
-    best_seg = (seg_join.withColumn("rn", F.row_number().over(w_pick_seg))
-                      .where(F.col("rn")==1).drop("rn")
-                      .withColumn("match_type", F.when(F.col("s.segment_id").isNotNull(), F.lit("segment")).otherwise(F.lit(None)))
-                      .select(
-                          F.col("w.device_id").alias("device_id"),
-                          F.col("w.router_ip").alias("router_ip"),
-                          F.col("w.wifi_ts").alias("wifi_ts"),
-                          F.col("s.seg_lat").alias("lat"),
-                          F.col("s.seg_lon").alias("lon"),
-                          "match_type",
-                          F.col("dt_to_seg_sec").alias("dt_sec"),
-                          F.col("s.seg_points").alias("seg_points"),
-                          F.col("s.seg_max_dist_m").alias("seg_max_dist_m")
-                      ))
+    coh = (coh.withColumn("span_min", (F.unix_timestamp("max_ts") - F.unix_timestamp("min_ts"))/60.0)
+              .withColumn("wide_ok",
+                          (F.col("k_points") >= F.lit(int(P["MIN_POINTS_WIDE"]))) &
+                          (F.col("p95_m") <= F.lit(float(P["MAX_RADIUS_M"]))) &
+                          (F.col("span_min") >= F.lit(int(P["MIN_SPAN_MIN"])))
+                         ))
 
-    matches = (best_strict.where(F.col("match_type").isNotNull())
-               .unionByName(best_seg.where(F.col("match_type").isNotNull()), allowMissingColumns=True)
+    # ---- Fusion strict + wide_ok
+    # Confiance (simple, ajustable):
+    # - strict: très haut, dépend dt
+    # - wide: dépend p95_m + k_points + span
+    wide_scored = (coh.where(F.col("wide_ok"))
+                   .withColumn("conf_wide",
+                               F.round(
+                                   70
+                                   + F.least(F.lit(15.0), F.log1p(F.col("k_points")) * 5)    # + points
+                                   + F.least(F.lit(10.0), F.col("span_min")/10.0)           # + span
+                                   - F.least(F.lit(25.0), F.col("p95_m")/5.0)               # - dispersion
+                               ).cast("int"))
+                   .select(
+                       "device_id", "ip", "wifi_ts",
+                       F.col("lat_med").alias("lat"),
+                       F.col("lon_med").alias("lon"),
+                       F.lit("wide_stable").alias("match_type"),
+                       F.col("conf_wide").alias("conf_point"),
+                       F.lit(None).cast("long").alias("dt_sec"),
+                       F.col("k_points").alias("k_points"),
+                       F.col("p95_m").alias("p95_m"),
+                       F.col("span_min").alias("span_min")
+                   ))
+
+    strict_scored = (best_strict.where(F.col("strict_dt_sec").isNotNull())
+                     .withColumn("conf_point",
+                                 F.round(90 - F.least(F.lit(30.0), F.col("strict_dt_sec")/10.0)).cast("int"))
+                     .select(
+                         "device_id", "ip", "wifi_ts",
+                         F.col("lat_strict").alias("lat"),
+                         F.col("lon_strict").alias("lon"),
+                         F.lit("strict").alias("match_type"),
+                         F.col("conf_point").alias("conf_point"),
+                         F.col("strict_dt_sec").alias("dt_sec"),
+                         F.lit(None).cast("int").alias("k_points"),
+                         F.lit(None).cast("double").alias("p95_m"),
+                         F.lit(None).cast("double").alias("span_min")
+                     ))
+
+    matches = (strict_scored.unionByName(wide_scored, allowMissingColumns=True)
                .withColumn("day", F.lit(day)))
 
-    # Confiance de l'observation: strict = plus haut, segment = dépend de dispersion et dt
-    matches = (matches.withColumn(
-        "conf_point",
-        F.when(F.col("match_type")=="strict",
-               F.round(90 - F.least(F.lit(30.0), F.col("dt_sec")/F.lit(10.0))).cast("int"))
-         .otherwise(
-               F.round(
-                   80
-                   - F.least(F.lit(25.0), F.col("dt_sec")/F.lit(60.0))
-                   - F.least(F.lit(20.0), F.coalesce(F.col("seg_max_dist_m"),F.lit(0.0))/F.lit(10.0))
-               ).cast("int")
-         )
-    ))
-
-    # Filtre bbox sur matches (évite router hors pays)
-    matches = matches.where(in_bbox(F.col("lat"),F.col("lon"), CONFIG["COUNTRY_BBOX"]))
-
-    (matches.write.mode("append").format("parquet").partitionBy("day").saveAsTable(CONFIG["MATCHES_DAILY_TABLE"]))
+    (matches.write.mode("append").format("parquet").partitionBy("day").saveAsTable(CFG["MATCH_DAILY"]))
     return matches
 
-# ============================================================
-# STEP 4 — ROUTER_DAILY (position robuste par routeur)
-# - médiane lat/lon pour centre initial
-# - outliers: distance au centre -> coupe au p95 (cap à MAX_OUTLIER_M)
-# - recompute centre final en moyenne pondérée
-# ============================================================
-def build_router_daily(spark, day):
-    m = (spark.table(CONFIG["MATCHES_DAILY_TABLE"])
-         .where(F.col("day")==F.lit(day))
-         .where(F.col("router_ip").isNotNull() & F.col("wifi_ts").isNotNull()
-                & F.col("lat").isNotNull() & F.col("lon").isNotNull())
-         .select("router_ip","device_id","wifi_ts","lat","lon","match_type",F.col("conf_point").cast("double").alias("conf_point")))
 
-    # Poids:
-    # - strict > segment
-    # - récent > ancien
-    # - conf_point renforce
-    m = (m.withColumn("w_type", F.when(F.col("match_type")=="strict", F.lit(1.0)).otherwise(F.lit(0.65)))
+# ------------------------------------------------------------
+# STEP 3 — IP_DAILY + IP_STATE: position stable par IP
+# But:
+# - À partir de match_daily: ip -> position robuste (médiane + filtre outliers)
+# - Score ip_confidence
+# - (Option) assigner router_id géographique (step4/5) ensuite
+# ------------------------------------------------------------
+def step3_ip_daily_and_state(spark, day):
+    m = (spark.table(CFG["MATCH_DAILY"])
+         .where(F.col("day") == F.lit(day))
+         .where("ip is not null and lat is not null and lon is not null and wifi_ts is not null")
+         .select("ip", "device_id", "wifi_ts", "lat", "lon", "match_type", F.col("conf_point").cast("double").alias("conf_point")))
+
+    # Poids: type + récence + qualité du point
+    m = (m.withColumn("w_type", F.when(F.col("match_type")=="strict", F.lit(1.0)).otherwise(F.lit(0.7)))
           .withColumn("age_days", F.datediff(F.current_timestamp(), F.col("wifi_ts")).cast("double"))
-          .withColumn("w_rec", exp_decay_days(F.col("age_days"), PARAMS["TAU_RECENCY_DAYS"]))
-          .withColumn("w", F.col("w_type") * F.col("w_rec") * (F.col("conf_point")/F.lit(100.0))))
+          .withColumn("w_rec", exp_decay_days(F.col("age_days"), P["TAU_REC_DAYS"]))
+          .withColumn("w", F.col("w_type") * F.col("w_rec") * (F.col("conf_point")/100.0)))
 
-    center0 = (m.groupBy("router_ip")
+    center0 = (m.groupBy("ip")
                .agg(F.expr("percentile_approx(lat, 0.5)").alias("lat_med"),
                     F.expr("percentile_approx(lon, 0.5)").alias("lon_med"),
                     F.count("*").alias("obs_total"),
-                    F.countDistinct("device_id").alias("devices_distinct"),
+                    F.countDistinct("device_id").alias("dev_cnt"),
                     F.max("wifi_ts").alias("last_seen_ts")))
 
-    m2 = (m.join(center0.select("router_ip","lat_med","lon_med"), "router_ip", "left")
+    m2 = (m.join(center0.select("ip","lat_med","lon_med"), "ip", "left")
             .withColumn("d_m", haversine_m(F.col("lat_med"),F.col("lon_med"),F.col("lat"),F.col("lon"))))
 
-    dist_stats = (m2.groupBy("router_ip")
-                  .agg(F.expr(f"percentile_approx(d_m, {PARAMS['OUTLIER_PCTL']})").alias("d_p95"))
-                  .withColumn("d_cut", F.least(F.col("d_p95"), F.lit(PARAMS["MAX_OUTLIER_M"]))))
+    dist_stats = (m2.groupBy("ip")
+                  .agg(F.expr(f"percentile_approx(d_m, {float(P['OUTLIER_PCTL'])})").alias("d_p95"))
+                  .withColumn("d_cut", F.least(F.col("d_p95"), F.lit(float(P["MAX_OUTLIER_M"])))))
 
-    # On garde uniquement les points proches du centre médian -> robuste aux outliers
-    m3 = (m2.join(dist_stats.select("router_ip","d_cut"), "router_ip", "left")
+    m3 = (m2.join(dist_stats.select("ip","d_cut"), "ip", "left")
             .where(F.col("d_m") <= F.col("d_cut")))
 
-    router_daily = (m3.groupBy("router_ip")
-                    .agg(
-                        (F.sum(F.col("lat")*F.col("w"))/F.sum("w")).alias("router_lat"),
-                        (F.sum(F.col("lon")*F.col("w"))/F.sum("w")).alias("router_lon"),
-                        F.count("*").alias("obs_kept"),
-                        F.countDistinct("device_id").alias("devices_kept"),
-                        F.avg("conf_point").alias("avg_point_conf"),
-                        F.max("wifi_ts").alias("last_seen_ts"),
-                        F.sum("w").alias("w_sum")
-                    )
-                    .withColumn("day", F.lit(day)))
+    ip_daily = (m3.groupBy("ip")
+                .agg(
+                    (F.sum(F.col("lat")*F.col("w"))/F.sum("w")).alias("lat"),
+                    (F.sum(F.col("lon")*F.col("w"))/F.sum("w")).alias("lon"),
+                    F.count("*").alias("obs_kept"),
+                    F.countDistinct("device_id").alias("dev_kept"),
+                    F.avg("conf_point").alias("avg_point_conf"),
+                    F.max("wifi_ts").alias("last_seen_ts"),
+                    F.sum("w").alias("w_sum")
+                )
+                .withColumn("day", F.lit(day)))
 
-    # Dispersion autour du centre final (p95) -> sert au scoring
-    m4 = (m3.join(router_daily.select("router_ip","router_lat","router_lon"), "router_ip", "left")
-            .withColumn("d_final_m", haversine_m(F.col("router_lat"),F.col("router_lon"),F.col("lat"),F.col("lon"))))
+    # dispersion autour centre final
+    m4 = (m3.join(ip_daily.select("ip","lat","lon"), "ip", "left")
+            .withColumn("d_final_m", haversine_m(F.col("lat"),F.col("lon"),F.col("lat"),F.col("lon"))) )  # dummy safe
+    # => correction: d_final_m doit être distance point->centre (on recalc correctement)
+    m4 = (m3.join(ip_daily.select("ip",F.col("lat").alias("c_lat"),F.col("lon").alias("c_lon")), "ip", "left")
+            .withColumn("d_final_m", haversine_m(F.col("c_lat"),F.col("c_lon"),F.col("lat"),F.col("lon"))))
 
-    disp = (m4.groupBy("router_ip")
+    disp = (m4.groupBy("ip")
             .agg(F.expr("percentile_approx(d_final_m, 0.95)").alias("disp_p95_m"),
-                 F.expr("percentile_approx(d_final_m, 0.5)").alias("disp_p50_m"),
-                 F.max("d_final_m").alias("disp_max_m")))
+                 F.expr("percentile_approx(d_final_m, 0.5)").alias("disp_p50_m")))
 
-    router_daily = router_daily.join(disp, "router_ip", "left").join(center0, "router_ip", "left")
+    ip_daily = (ip_daily.join(disp, "ip", "left")
+                .join(center0, "ip", "left"))
 
-    # Score routeur 0..100
-    router_daily = (router_daily
+    # score ip 0..100
+    ip_daily = (ip_daily
         .withColumn("age_days_last", F.datediff(F.current_timestamp(), F.col("last_seen_ts")).cast("double"))
-        .withColumn("S_rec", exp_decay_days(F.col("age_days_last"), PARAMS["TAU_RECENCY_DAYS"]))
-        .withColumn("S_dev", F.least(F.lit(1.0), F.log1p(F.col("devices_kept"))/F.log1p(F.lit(20.0))))
+        .withColumn("S_rec", exp_decay_days(F.col("age_days_last"), P["TAU_REC_DAYS"]))
+        .withColumn("S_dev", F.least(F.lit(1.0), F.log1p(F.col("dev_kept"))/F.log1p(F.lit(20.0))))
         .withColumn("S_obs", F.least(F.lit(1.0), F.log1p(F.col("obs_kept"))/F.log1p(F.lit(200.0))))
         .withColumn("S_disp", F.exp(-F.col("disp_p95_m")/F.lit(250.0)))
         .withColumn("conf01", F.clamp(0.30*F.col("S_rec")+0.25*F.col("S_dev")+0.20*F.col("S_obs")+0.25*F.col("S_disp"), 0, 1))
-        .withColumn("router_confidence", F.round(F.col("conf01")*100).cast("int"))
+        .withColumn("ip_confidence", F.round(F.col("conf01")*100).cast("int"))
         .withColumn("flags", F.array_remove(F.array(
-            F.when(F.col("devices_kept") < F.lit(2), F.lit("LOW_DEVICE_COUNT")),
-            F.when(F.col("disp_p95_m") > F.lit(1000.0), F.lit("HIGH_DISPERSION")),
-            F.when(F.col("obs_kept") < F.lit(5), F.lit("LOW_OBS"))
+            F.when(F.col("dev_kept") < 2, F.lit("LOW_DEVICE_COUNT")),
+            F.when(F.col("disp_p95_m") > 1000, F.lit("HIGH_DISPERSION")),
+            F.when(F.col("obs_kept") < 5, F.lit("LOW_OBS"))
         ), F.lit(None)))
     )
 
-    (router_daily.write.mode("append").format("parquet").partitionBy("day").saveAsTable(CONFIG["ROUTER_DAILY_TABLE"]))
-    return router_daily
+    # write daily
+    (ip_daily.write.mode("append").format("parquet").partitionBy("day").saveAsTable(CFG["IP_DAILY"]))
 
-# ============================================================
-# STEP 5 — ROUTER_STATE (hystérésis)
-# - Evite que la position du routeur saute tous les jours
-# - On "switch" vers la nouvelle position seulement si elle est nettement meilleure
-# ============================================================
-def update_router_state(spark, day):
-    daily = (spark.table(CONFIG["ROUTER_DAILY_TABLE"])
-             .where(F.col("day")==F.lit(day))
-             .select("router_ip","router_lat","router_lon","router_confidence","last_seen_ts","flags"))
+    # upsert ip_state (latest)
+    ip_state = (ip_daily.select(
+                    "ip","lat","lon","ip_confidence","last_seen_ts","flags"
+                )
+                .withColumn("router_id", F.lit(None).cast("string"))   # step4 assignera
+                .withColumn("last_update_ts", F.current_timestamp()))
 
-    # Etat précédent: dernière position acceptée + confiance
+    ip_state_b = add_bucket(ip_state, "ip", CFG["BUCKETS"])
+    ensure_table_exists_like(spark, CFG["IP_STATE"], ip_state_b)
+    upsert_bucket_hive(spark, CFG["IP_STATE"], ip_state, "ip", CFG["BUCKETS"])
+
+    return ip_daily
+
+
+# ------------------------------------------------------------
+# STEP 4 — Créer router_id géographique à partir de ip_state lat/lon
+# But:
+# - IP change tout le temps -> on veut un identifiant STABLE par zone géographique
+# - router_id = hash(geo_cell)
+#
+# Implémentation simple, très efficace:
+# - on convertit lat/lon -> cellule métrique approximative:
+#   * cell_y = floor(lat * meters_per_degree_lat / cell_m)
+#   * cell_x = floor(lon * meters_per_degree_lon(lat) / cell_m)
+# - router_id = sha1(cell_x, cell_y) (ou xxhash64)
+#
+# Ensuite, on met à jour ip_state.router_id
+# ------------------------------------------------------------
+def _meters_per_deg_lon(lat_col):
+    # approx: 111320 * cos(lat)
+    return F.lit(111320.0) * F.cos(F.radians(lat_col))
+
+def _meters_per_deg_lat():
+    return F.lit(110540.0)
+
+def step4_assign_router_id_to_ip(spark, day):
+    # On prend les IP mises à jour aujourd'hui depuis ip_daily (moins coûteux)
+    ip_today = (spark.table(CFG["IP_DAILY"])
+                .where(F.col("day") == F.lit(day))
+                .select("ip", "lat", "lon", "ip_confidence", "last_seen_ts", "flags")
+                .where("ip is not null and lat is not null and lon is not null"))
+
+    cell_m = float(P["ROUTER_CELL_M"])
+    ip_with_cell = (ip_today
+        .withColumn("cell_y", F.floor((F.col("lat") * _meters_per_deg_lat()) / F.lit(cell_m)).cast("long"))
+        .withColumn("cell_x", F.floor((F.col("lon") * _meters_per_deg_lon(F.col("lat"))) / F.lit(cell_m)).cast("long"))
+        .withColumn("router_id", F.sha1(F.concat_ws(":", F.col("cell_x").cast("string"), F.col("cell_y").cast("string"))))
+    )
+
+    # Upsert dans ip_state : router_id + lat/lon/score etc.
+    ip_state_upd = (ip_with_cell
+        .select("ip","lat","lon","router_id", F.col("ip_confidence").alias("ip_confidence"),
+                "last_seen_ts","flags")
+        .withColumn("last_update_ts", F.current_timestamp()))
+
+    upsert_bucket_hive(spark, CFG["IP_STATE"], ip_state_upd, "ip", CFG["BUCKETS"])
+    return ip_state_upd
+
+
+# ------------------------------------------------------------
+# STEP 5 — ROUTER_DAILY + ROUTER_STATE: agréger les IP d'un même router_id
+# But:
+# - Plusieurs IP peuvent tomber dans la même cellule => même router_id
+# - On fusionne pour affiner la position du routeur avec le temps
+# - Hystérésis: n'update que si amélioration suffisante
+# ------------------------------------------------------------
+def step5_router_daily_and_state(spark, day):
+    # IP du jour avec router_id
+    ip_state_today = (spark.table(CFG["IP_STATE"])
+                      .join(spark.table(CFG["IP_DAILY"]).where(F.col("day")==F.lit(day)).select("ip").distinct(),
+                            "ip", "inner")
+                      .select("ip","router_id","lat","lon","ip_confidence","last_seen_ts"))
+
+    # Router daily = agrégation pondérée par ip_confidence + récence
+    df = (ip_state_today
+          .withColumn("age_days", F.datediff(F.current_timestamp(), F.col("last_seen_ts")).cast("double"))
+          .withColumn("w_rec", exp_decay_days(F.col("age_days"), P["TAU_REC_DAYS"]))
+          .withColumn("w", (F.col("ip_confidence")/100.0) * F.col("w_rec"))
+         )
+
+    router_daily = (df.groupBy("router_id")
+        .agg(
+            (F.sum(F.col("lat")*F.col("w"))/F.sum("w")).alias("lat"),
+            (F.sum(F.col("lon")*F.col("w"))/F.sum("w")).alias("lon"),
+            F.count("*").alias("ips_used"),
+            F.max("last_seen_ts").alias("last_seen_ts"),
+            F.avg("ip_confidence").alias("avg_ip_conf")
+        )
+        .withColumn("day", F.lit(day))
+    )
+
+    # Router confidence (simple, ajustable)
+    router_daily = (router_daily
+        .withColumn("S_ip", F.least(F.lit(1.0), F.log1p(F.col("ips_used"))/F.log1p(F.lit(15.0))))
+        .withColumn("S_conf", F.col("avg_ip_conf")/100.0)
+        .withColumn("conf01", F.clamp(0.55*F.col("S_conf") + 0.45*F.col("S_ip"), 0, 1))
+        .withColumn("router_confidence", F.round(F.col("conf01")*100).cast("int"))
+        .withColumn("flags", F.array_remove(F.array(
+            F.when(F.col("ips_used") < 2, F.lit("LOW_IP_COUNT"))
+        ), F.lit(None)))
+    )
+
+    (router_daily.write.mode("append").format("parquet").partitionBy("day").saveAsTable(CFG["ROUTER_DAILY"]))
+
+    # --- Router state with hysteresis
     try:
-        prev = spark.table(CONFIG["ROUTER_STATE_TABLE"]).select(
-            "router_ip",
+        prev = spark.table(CFG["ROUTER_STATE"]).select(
+            "router_id",
             F.col("lat").alias("prev_lat"),
             F.col("lon").alias("prev_lon"),
             F.col("router_confidence").alias("prev_conf"),
@@ -509,220 +509,289 @@ def update_router_state(spark, day):
             F.col("flags").alias("prev_flags")
         )
     except Exception:
-        prev = spark.createDataFrame([], "router_ip string, prev_lat double, prev_lon double, prev_conf int, prev_last_seen_ts timestamp, prev_flags array<string>")
+        prev = spark.createDataFrame([], "router_id string, prev_lat double, prev_lon double, prev_conf int, prev_last_seen_ts timestamp, prev_flags array<string>")
 
-    cand = (daily.join(prev, "router_ip", "left")
-            # jump = distance entre ancienne et nouvelle position
-            .withColumn("jump_m", haversine_m(F.col("prev_lat"),F.col("prev_lon"),F.col("router_lat"),F.col("router_lon")))
-            .withColumn("jump_suspect", (F.col("jump_m") > F.lit(PARAMS["JUMP_SUSPECT_M"])))
-            # si état précédent trop vieux => on accepte plus facilement le switch
+    cand = (router_daily.select("router_id","lat","lon","router_confidence","last_seen_ts","flags")
+            .join(prev, "router_id", "left")
+            .withColumn("jump_m", haversine_m(F.col("prev_lat"),F.col("prev_lon"),F.col("lat"),F.col("lon")))
+            .withColumn("jump_suspect", F.col("jump_m") > F.lit(float(P["JUMP_SUSPECT_M"])))
             .withColumn("prev_age_days", F.datediff(F.current_timestamp(), F.col("prev_last_seen_ts")).cast("double"))
-            .withColumn("prev_stale", F.col("prev_last_seen_ts").isNull() | (F.col("prev_age_days") > F.lit(PARAMS["STALE_DAYS"])))
-            # hystérésis: new doit battre old d'au moins HYST_DELTA
+            .withColumn("prev_stale", F.col("prev_last_seen_ts").isNull() | (F.col("prev_age_days") > F.lit(int(P["STALE_DAYS"]))))
             .withColumn("should_switch",
                         F.when(F.col("prev_conf").isNull(), F.lit(True))
                          .when(F.col("prev_stale"), F.lit(True))
-                         .when(F.col("router_confidence") >= (F.col("prev_conf")+F.lit(PARAMS["HYST_DELTA"])), F.lit(True))
+                         .when(F.col("router_confidence") >= (F.col("prev_conf")+F.lit(int(P["HYST_DELTA"]))), F.lit(True))
                          .otherwise(F.lit(False)))
            )
 
-    # Si jump énorme, on est encore plus conservateur (évite téléportations)
     cand = cand.withColumn(
         "should_switch",
-        F.when(F.col("jump_suspect") & (F.col("router_confidence") < (F.col("prev_conf")+F.lit(PARAMS["HYST_DELTA"]+10))), F.lit(False))
+        F.when(F.col("jump_suspect") & (F.col("router_confidence") < (F.col("prev_conf")+F.lit(int(P["HYST_DELTA"])+10))), F.lit(False))
          .otherwise(F.col("should_switch"))
     )
 
-    new_state = (cand.select(
-        "router_ip",
-        F.when(F.col("should_switch"), F.col("router_lat")).otherwise(F.col("prev_lat")).alias("lat"),
-        F.when(F.col("should_switch"), F.col("router_lon")).otherwise(F.col("prev_lon")).alias("lon"),
+    router_state = (cand.select(
+        "router_id",
+        F.when(F.col("should_switch"), F.col("lat")).otherwise(F.col("prev_lat")).alias("lat"),
+        F.when(F.col("should_switch"), F.col("lon")).otherwise(F.col("prev_lon")).alias("lon"),
         F.when(F.col("should_switch"), F.col("router_confidence")).otherwise(F.col("prev_conf")).alias("router_confidence"),
-        # last_seen = max(prev, new)
-        F.greatest(F.col("last_seen_ts"), F.col("prev_last_seen_ts")).alias("last_seen_ts"),
-        F.current_timestamp().alias("last_update_ts"),
-        # flags: union prev + daily + jump suspect
-        F.array_distinct(F.concat(F.coalesce(F.col("prev_flags"),F.array()),
-                                 F.coalesce(F.col("flags"),F.array()),
-                                 F.when(F.col("jump_suspect"), F.array(F.lit("JUMP_SUSPECT"))).otherwise(F.array())
-                                )).alias("flags")
-    ))
-
-    ensure_bucketed_table_exists(spark, CONFIG["ROUTER_STATE_TABLE"], add_bucket(new_state, "router_ip", CONFIG["BUCKETS"]))
-    upsert_bucket_overwrite(spark, CONFIG["ROUTER_STATE_TABLE"], new_state, "router_ip", CONFIG["BUCKETS"])
-    return new_state
-
-# ============================================================
-# STEP 6 — CAMERA_IP_STATE (ip_best sur 30 jours à partir de comm_daily)
-# - But: associer chaque caméra à une IP "représentative"
-# - On combine: share (fréquence) + récence + volume
-# ============================================================
-def update_camera_ip_state(spark, day):
-    start_day = F.date_sub(F.lit(day).cast("date"), PARAMS["IP_WINDOW_DAYS"]-1)
-
-    comm30 = (spark.table(CONFIG["COMM_DAILY_TABLE"])
-              .where(F.col("day").between(F.date_format(start_day, "yyyy-MM-dd"), F.lit(day)))
-              .select("camera_id","ip","obs_count","last_ts"))
-
-    cam_total = comm30.groupBy("camera_id").agg(
-        F.sum("obs_count").alias("obs_total"),
-        F.max("last_ts").alias("cam_last_seen_ts")
-    )
-
-    cam_ip = comm30.groupBy("camera_id","ip").agg(
-        F.sum("obs_count").alias("obs_ip"),
-        F.max("last_ts").alias("last_seen_ip_ts")
-    )
-
-    scored = (cam_ip.join(cam_total, "camera_id", "left")
-              .withColumn("share", F.col("obs_ip")/F.col("obs_total"))
-              .withColumn("age_days_ip", F.datediff(F.current_timestamp(), F.col("last_seen_ip_ts")).cast("double"))
-              .withColumn("S_rec", exp_decay_days(F.col("age_days_ip"), 14.0))
-              .withColumn("S_vol", F.least(F.lit(1.0), F.log1p(F.col("obs_ip"))/F.log1p(F.lit(50.0))))
-              .withColumn("score01", F.clamp(0.6*F.col("share")+0.25*F.col("S_rec")+0.15*F.col("S_vol"), 0, 1))
-             )
-
-    w = Window.partitionBy("camera_id").orderBy(F.col("score01").desc(), F.col("last_seen_ip_ts").desc())
-    best = (scored.withColumn("rn", F.row_number().over(w)).where(F.col("rn")==1).drop("rn")
-            .select(
-                "camera_id",
-                F.col("ip").alias("ip_best"),
-                F.col("last_seen_ip_ts").alias("ip_best_last_seen_ts"),
-                F.col("obs_ip").alias("ip_best_obs_count"),
-                F.col("share").alias("ip_best_share"),
-                F.round(F.col("score01")*100).cast("int").alias("ip_confidence"),
-                F.col("cam_last_seen_ts").alias("last_seen_ts"),
-                F.current_timestamp().alias("last_update_ts")
-            ))
-
-    ensure_bucketed_table_exists(spark, CONFIG["CAMERA_IP_STATE_TABLE"], add_bucket(best, "camera_id", CONFIG["BUCKETS"]))
-    upsert_bucket_overwrite(spark, CONFIG["CAMERA_IP_STATE_TABLE"], best, "camera_id", CONFIG["BUCKETS"])
-    return best
-
-# ============================================================
-# STEP 7 — CAMERA_MASTER (camera -> ip_best -> router_state)
-# - On récupère lat/lon du routeur et un score camera_conf
-# - Puis hystérésis pour éviter que la caméra saute trop facilement
-# ============================================================
-def update_camera_master(spark, day):
-    # Caméras impactées: vues aujourd'hui (tu peux élargir: aussi si router_state change)
-    comm_today = (spark.table(CONFIG["COMM_DAILY_TABLE"])
-                  .where(F.col("day")==F.lit(day))
-                  .select("camera_id").distinct())
-
-    cam_ip = (spark.table(CONFIG["CAMERA_IP_STATE_TABLE"])
-              .join(comm_today, "camera_id", "inner")
-              .select("camera_id","ip_best","ip_best_share","ip_confidence","last_seen_ts"))
-
-    router = (spark.table(CONFIG["ROUTER_STATE_TABLE"])
-              .select(F.col("router_ip").alias("ip_best"),
-                      F.col("lat").alias("r_lat"),
-                      F.col("lon").alias("r_lon"),
-                      F.col("router_confidence").alias("r_conf"),
-                      F.col("last_seen_ts").alias("r_last_seen_ts")))
-
-    cand = (cam_ip.join(router, "ip_best", "left")
-            .withColumn("hard_reject", F.col("r_lat").isNull() | F.col("r_lon").isNull())
-            .withColumn("is_valid_bbox", in_bbox(F.col("r_lat"),F.col("r_lon"), CONFIG["COUNTRY_BBOX"]))
-            .withColumn("S_router", F.coalesce(F.col("r_conf")/100.0, F.lit(0.0)))
-            .withColumn("S_ipshare", F.clamp(F.coalesce(F.col("ip_best_share"),F.lit(0.0)), 0, 1))
-            # score caméra: routeur (65%) + stabilité IP (35%)
-            .withColumn("score01",
-                        F.when(F.col("hard_reject"), F.lit(0.0))
-                         .otherwise(F.clamp(0.65*F.col("S_router")+0.35*F.col("S_ipshare"), 0, 1)))
-            .withColumn("candidate_conf", F.round(F.col("score01")*100).cast("int"))
-            # si hors bbox => on casse le score
-            .withColumn("candidate_conf",
-                        F.when(~F.col("is_valid_bbox"), F.round(F.col("candidate_conf")*F.lit(0.05)).cast("int"))
-                         .otherwise(F.col("candidate_conf")))
-            .withColumn("flags", F.array_remove(F.array(
-                F.when(F.col("hard_reject"), F.lit("HARD_REJECT")),
-                F.when(~F.col("is_valid_bbox"), F.lit("OUT_COUNTRY_BBOX")),
-                F.when(F.col("ip_best_share") < 0.25, F.lit("LOW_IP_STABILITY"))
-            ), F.lit(None)))
-           )
-
-    # état caméra précédent
-    try:
-        prev = (spark.table(CONFIG["CAMERA_MASTER_TABLE"])
-                .join(comm_today, "camera_id", "inner")
-                .select(
-                    "camera_id",
-                    F.col("lat").alias("prev_lat"),
-                    F.col("lon").alias("prev_lon"),
-                    F.col("confidence").alias("prev_conf"),
-                    F.col("last_seen_ts").alias("prev_last_seen_ts"),
-                    F.col("flags").alias("prev_flags")
-                ))
-    except Exception:
-        prev = spark.createDataFrame([], "camera_id string, prev_lat double, prev_lon double, prev_conf int, prev_last_seen_ts timestamp, prev_flags array<string>")
-
-    merged = (cand.join(prev, "camera_id", "left")
-              .withColumn("jump_m", haversine_m(F.col("prev_lat"),F.col("prev_lon"),F.col("r_lat"),F.col("r_lon")))
-              .withColumn("jump_suspect", (F.col("jump_m") > F.lit(PARAMS["JUMP_SUSPECT_M"])))
-              .withColumn("prev_age_days", F.datediff(F.current_timestamp(), F.col("prev_last_seen_ts")).cast("double"))
-              .withColumn("prev_stale", F.col("prev_last_seen_ts").isNull() | (F.col("prev_age_days") > F.lit(PARAMS["STALE_DAYS"])))
-              .withColumn("should_switch",
-                          F.when(F.col("prev_conf").isNull(), F.lit(True))
-                           .when(F.col("prev_stale"), F.lit(True))
-                           .when(F.col("candidate_conf") >= (F.col("prev_conf")+F.lit(PARAMS["HYST_DELTA"])), F.lit(True))
-                           .otherwise(F.lit(False)))
-             )
-
-    merged = merged.withColumn(
-        "should_switch",
-        F.when(F.col("jump_suspect") & (F.col("candidate_conf") < (F.col("prev_conf")+F.lit(PARAMS["HYST_DELTA"]+10))), F.lit(False))
-         .otherwise(F.col("should_switch"))
-    )
-
-    new_master = (merged.select(
-        "camera_id",
-        F.when(F.col("should_switch"), F.col("r_lat")).otherwise(F.col("prev_lat")).alias("lat"),
-        F.when(F.col("should_switch"), F.col("r_lon")).otherwise(F.col("prev_lon")).alias("lon"),
-        F.when(F.col("should_switch"), F.col("candidate_conf")).otherwise(F.col("prev_conf")).alias("confidence"),
-        F.lit("router_state").alias("source"),
         F.greatest(F.col("last_seen_ts"), F.col("prev_last_seen_ts")).alias("last_seen_ts"),
         F.current_timestamp().alias("last_update_ts"),
         F.array_distinct(F.concat(
-            F.coalesce(F.col("prev_flags"),F.array()),
-            F.coalesce(F.col("flags"),F.array()),
+            F.coalesce(F.col("prev_flags"), F.array()),
+            F.coalesce(F.col("flags"), F.array()),
             F.when(F.col("jump_suspect"), F.array(F.lit("JUMP_SUSPECT"))).otherwise(F.array())
         )).alias("flags")
     ))
 
-    ensure_bucketed_table_exists(spark, CONFIG["CAMERA_MASTER_TABLE"], add_bucket(new_master, "camera_id", CONFIG["BUCKETS"]))
-    upsert_bucket_overwrite(spark, CONFIG["CAMERA_MASTER_TABLE"], new_master, "camera_id", CONFIG["BUCKETS"])
-    return new_master
+    router_state_b = add_bucket(router_state, "router_id", CFG["BUCKETS"])
+    ensure_table_exists_like(spark, CFG["ROUTER_STATE"], router_state_b)
+    upsert_bucket_hive(spark, CFG["ROUTER_STATE"], router_state, "router_id", CFG["BUCKETS"])
 
-# ============================================================
-# ORCHESTRATION DAILY
-# ============================================================
+    return router_daily
+
+
+# ------------------------------------------------------------
+# STEP 6 — CAMERA_DAILY: camera -> router_id (via IP -> router_id)
+# But:
+# - L'IP bouge => on ne cherche PAS ip_best.
+# - Chaque jour, on observe des (camera_id, ip) dans comm_daily,
+#   on mappe ces ip vers router_id via ip_state,
+#   on garde le router_id qui reçoit assez de "hits" et est géographiquement cohérent.
+# ------------------------------------------------------------
+def step6_camera_daily(spark, day):
+    comm = (spark.table(CFG["COMM_DAILY"])
+            .where(F.col("day")==F.lit(day))
+            .select("camera_id","ip","obs_count","last_ts"))
+
+    ip_state = spark.table(CFG["IP_STATE"]).select("ip","router_id","lat","lon","ip_confidence","last_seen_ts")
+
+    # camera_ip_observations enrichies
+    cam_ip = (comm.join(ip_state, "ip", "left")
+              .where("router_id is not null and lat is not null and lon is not null")
+              .withColumn("w", (F.col("obs_count").cast("double") * (F.col("ip_confidence")/100.0)))
+             )
+
+    # Pour une camera_id: quel router_id domine aujourd'hui ?
+    by_router = (cam_ip.groupBy("camera_id","router_id")
+                 .agg(F.sum("obs_count").alias("hits"),
+                      F.sum("w").alias("w_sum"),
+                      F.max("last_ts").alias("last_ts"),
+                      F.expr("percentile_approx(lat, 0.5)").alias("lat_med"),
+                      F.expr("percentile_approx(lon, 0.5)").alias("lon_med")))
+
+    # Exiger min hits
+    by_router = by_router.where(F.col("hits") >= F.lit(int(P["CAM_LINK_MIN_HITS"])))
+
+    # Choisir le meilleur router_id pour la camera (par w_sum puis last_ts)
+    w_pick = Window.partitionBy("camera_id").orderBy(F.col("w_sum").desc(), F.col("last_ts").desc())
+    best = (by_router.withColumn("rn", F.row_number().over(w_pick))
+            .where(F.col("rn")==1).drop("rn")
+            .withColumn("day", F.lit(day)))
+
+    # Position camera du jour = position router_state (plus stable) si dispo, sinon médiane IP
+    router_state = spark.table(CFG["ROUTER_STATE"]).select("router_id", F.col("lat").alias("r_lat"), F.col("lon").alias("r_lon"),
+                                                          "router_confidence","last_seen_ts")
+
+    cam_daily = (best.join(router_state, "router_id", "left")
+                 .withColumn("lat",
+                             F.when(F.col("r_lat").isNotNull(), F.col("r_lat")).otherwise(F.col("lat_med")))
+                 .withColumn("lon",
+                             F.when(F.col("r_lon").isNotNull(), F.col("r_lon")).otherwise(F.col("lon_med")))
+                 .withColumn("camera_confidence",
+                             F.round(F.clamp(
+                                 0.7*(F.coalesce(F.col("router_confidence"),F.lit(0))/100.0) +
+                                 0.3*F.least(F.lit(1.0), F.log1p(F.col("hits"))/F.log1p(F.lit(50.0))),
+                                 0, 1
+                             )*100).cast("int"))
+                 .withColumn("flags", F.array_remove(F.array(
+                     F.when(F.col("router_confidence").isNull(), F.lit("ROUTER_STATE_MISSING"))
+                 ), F.lit(None)))
+                 .select("day","camera_id","router_id","lat","lon","hits","last_ts",
+                         "camera_confidence","flags")
+                )
+
+    (cam_daily.write.mode("append").format("parquet").partitionBy("day").saveAsTable(CFG["CAM_DAILY"]))
+    return cam_daily
+
+
+# ------------------------------------------------------------
+# STEP 7 — CAMERA_MASTER: stabilité camera (hystérésis)
+# But:
+# - position stable finale de la camera
+# - ne pas "sauter" si variation faible / bruit
+# ------------------------------------------------------------
+def step7_camera_master(spark, day):
+    cam_daily = (spark.table(CFG["CAM_DAILY"])
+                 .where(F.col("day")==F.lit(day))
+                 .select("camera_id","router_id","lat","lon","camera_confidence", F.col("last_ts").alias("last_seen_ts"), "flags"))
+
+    try:
+        prev = spark.table(CFG["CAM_MASTER"]).select(
+            "camera_id",
+            F.col("router_id").alias("prev_router_id"),
+            F.col("lat").alias("prev_lat"),
+            F.col("lon").alias("prev_lon"),
+            F.col("confidence").alias("prev_conf"),
+            F.col("last_seen_ts").alias("prev_last_seen_ts"),
+            F.col("flags").alias("prev_flags")
+        )
+    except Exception:
+        prev = spark.createDataFrame([], """
+            camera_id string, prev_router_id string, prev_lat double, prev_lon double,
+            prev_conf int, prev_last_seen_ts timestamp, prev_flags array<string>
+        """)
+
+    cand = (cam_daily.join(prev, "camera_id", "left")
+            .withColumn("jump_m", haversine_m(F.col("prev_lat"),F.col("prev_lon"),F.col("lat"),F.col("lon")))
+            .withColumn("jump_suspect", F.col("jump_m") > F.lit(float(P["JUMP_SUSPECT_M"])))
+            .withColumn("prev_age_days", F.datediff(F.current_timestamp(), F.col("prev_last_seen_ts")).cast("double"))
+            .withColumn("prev_stale", F.col("prev_last_seen_ts").isNull() | (F.col("prev_age_days") > F.lit(int(P["STALE_DAYS"]))))
+            .withColumn("should_switch",
+                        F.when(F.col("prev_conf").isNull(), F.lit(True))
+                         .when(F.col("prev_stale"), F.lit(True))
+                         .when(F.col("camera_confidence") >= (F.col("prev_conf")+F.lit(int(P["HYST_DELTA"]))), F.lit(True))
+                         .otherwise(F.lit(False)))
+           )
+
+    cand = cand.withColumn(
+        "should_switch",
+        F.when(F.col("jump_suspect") & (F.col("camera_confidence") < (F.col("prev_conf")+F.lit(int(P["HYST_DELTA"])+10))), F.lit(False))
+         .otherwise(F.col("should_switch"))
+    )
+
+    master = (cand.select(
+        "camera_id",
+        F.when(F.col("should_switch"), F.col("router_id")).otherwise(F.col("prev_router_id")).alias("router_id"),
+        F.when(F.col("should_switch"), F.col("lat")).otherwise(F.col("prev_lat")).alias("lat"),
+        F.when(F.col("should_switch"), F.col("lon")).otherwise(F.col("prev_lon")).alias("lon"),
+        F.when(F.col("should_switch"), F.col("camera_confidence")).otherwise(F.col("prev_conf")).alias("confidence"),
+        F.greatest(F.col("last_seen_ts"), F.col("prev_last_seen_ts")).alias("last_seen_ts"),
+        F.current_timestamp().alias("last_update_ts"),
+        F.array_distinct(F.concat(
+            F.coalesce(F.col("prev_flags"), F.array()),
+            F.coalesce(F.col("flags"), F.array()),
+            F.when(F.col("jump_suspect"), F.array(F.lit("JUMP_SUSPECT"))).otherwise(F.array())
+        )).alias("flags")
+    ))
+
+    master_b = add_bucket(master, "camera_id", CFG["BUCKETS"])
+    ensure_table_exists_like(spark, CFG["CAM_MASTER"], master_b)
+    upsert_bucket_hive(spark, CFG["CAM_MASTER"], master, "camera_id", CFG["BUCKETS"])
+
+    return master
+
+
+# ------------------------------------------------------------
+# STEP 8 — MOBILITY: détecter caméras mobiles par instabilité
+# Idée:
+# - Une camera FIXE doit converger vers 1 zone/router_id et avoir peu de jumps
+# - Une camera MOBILE:
+#   * change souvent de router_id / zones distinctes
+#   * jumps fréquents (km) sur peu de temps
+#
+# Sorties:
+# - gold.camera_mobility_daily: features window
+# - gold.camera_mobility_state: score + label stable
+# ------------------------------------------------------------
+def step8_camera_mobility(spark, day):
+    # Fenêtre de jours
+    start_date = F.date_sub(F.lit(day).cast("date"), int(P["MOB_WIN_DAYS"])-1)
+    cam_hist = (spark.table(CFG["CAM_DAILY"])
+                .where(F.col("day").between(F.date_format(start_date, "yyyy-MM-dd"), F.lit(day)))
+                .select("day","camera_id","router_id","lat","lon",F.col("last_ts").alias("ts"),
+                        F.col("camera_confidence").alias("conf")))
+
+    # Ordonner par ts et calculer distances successives
+    w = Window.partitionBy("camera_id").orderBy(F.col("ts").asc())
+    hist2 = (cam_hist
+             .withColumn("prev_lat", F.lag("lat").over(w))
+             .withColumn("prev_lon", F.lag("lon").over(w))
+             .withColumn("prev_ts",  F.lag("ts").over(w))
+             .withColumn("jump_m", haversine_m(F.col("prev_lat"),F.col("prev_lon"),F.col("lat"),F.col("lon")))
+             .withColumn("dt_min", (F.unix_timestamp("ts") - F.unix_timestamp("prev_ts"))/60.0)
+             .withColumn("jump_flag", F.when(F.col("jump_m") > F.lit(float(P["MOB_JUMP_M"])), F.lit(1)).otherwise(F.lit(0)))
+            )
+
+    # Features par camera sur la fenêtre
+    feats = (hist2.groupBy("camera_id")
+             .agg(
+                 F.count("*").alias("obs"),
+                 F.countDistinct("router_id").alias("zones"),
+                 F.sum("jump_flag").alias("big_jumps"),
+                 F.expr("percentile_approx(jump_m, 0.95)").alias("jump_p95_m"),
+                 F.max("jump_m").alias("jump_max_m"),
+                 F.avg("conf").alias("avg_conf"),
+                 F.max("ts").alias("last_seen_ts")
+             )
+             .withColumn("day", F.lit(day))
+            )
+
+    # Score mobilité (0..100)
+    # - zones nombreuses => mobile
+    # - big_jumps => mobile
+    # - jump_p95 élevé => mobile
+    # - si peu d'obs => on baisse le score (incertitude)
+    feats = (feats
+        .withColumn("S_zones", F.clamp(F.col("zones")/F.lit(float(P["MOB_SWITCH_ZONES"])), 0, 1))
+        .withColumn("S_jumps", F.clamp(F.col("big_jumps")/F.lit(5.0), 0, 1))
+        .withColumn("S_p95",   F.clamp(F.col("jump_p95_m")/F.lit(5000.0), 0, 1))  # 5km p95 => 1
+        .withColumn("S_obs",   F.clamp(F.log1p(F.col("obs"))/F.log1p(F.lit(50.0)), 0, 1))
+        .withColumn("mob01",   F.clamp(0.45*F.col("S_zones") + 0.35*F.col("S_jumps") + 0.20*F.col("S_p95"), 0, 1))
+        .withColumn("mob01",   F.col("mob01") * F.col("S_obs"))  # pénalise si peu d'obs
+        .withColumn("mobility_score", F.round(F.col("mob01")*100).cast("int"))
+        .withColumn("is_mobile_probable",
+                    (F.col("obs") >= F.lit(int(P["MOB_MIN_OBS"]))) & (F.col("mobility_score") >= F.lit(int(P["MOB_SCORE_TH"]))))
+        .withColumn("flags", F.array_remove(F.array(
+            F.when(F.col("obs") < F.lit(int(P["MOB_MIN_OBS"])), F.lit("LOW_OBS")),
+            F.when(F.col("zones") >= F.lit(int(P["MOB_SWITCH_ZONES"])), F.lit("MANY_ZONES")),
+            F.when(F.col("big_jumps") > F.lit(0), F.lit("BIG_JUMPS"))
+        ), F.lit(None)))
+    )
+
+    (feats.write.mode("append").format("parquet").partitionBy("day").saveAsTable(CFG["MOB_DAILY"]))
+
+    # upsert mobility_state
+    mob_state = (feats.select("camera_id","mobility_score","is_mobile_probable","last_seen_ts","flags")
+                 .withColumn("last_update_ts", F.current_timestamp()))
+    mob_state_b = add_bucket(mob_state, "camera_id", CFG["BUCKETS"])
+    ensure_table_exists_like(spark, CFG["CAM_MOB_STATE"], mob_state_b)
+    upsert_bucket_hive(spark, CFG["CAM_MOB_STATE"], mob_state, "camera_id", CFG["BUCKETS"])
+
+    return feats
+
+
+# ------------------------------------------------------------
+# ORCHESTRATION
+# ------------------------------------------------------------
 def run_daily(spark, day):
-    # Conseil: fixe le timezone pour éviter des surprises dans datediff etc.
+    # Bon réflexe: timezone stable
     spark.conf.set("spark.sql.session.timeZone", "UTC")
 
-    # 1) Résumé comm du jour
-    build_comm_daily(spark, day)
+    # 1) compresser comm
+    step1_comm_daily(spark, day)
 
-    # 2) Segments GPS incremental
-    build_segments_incremental(spark, day)
+    # 2) wifi -> gps (logique preuve)
+    step2_match_daily(spark, day)
 
-    # 3) Matches Wi-Fi -> position (strict puis segment)
-    build_matches_daily(spark, day)
+    # 3) ip position (daily + state)
+    step3_ip_daily_and_state(spark, day)
 
-    # 4) RouterDaily (robuste)
-    build_router_daily(spark, day)
+    # 4) router_id geo assign
+    step4_assign_router_id_to_ip(spark, day)
 
-    # 5) RouterState (hystérésis)
-    update_router_state(spark, day)
+    # 5) router daily + state (hystérésis)
+    step5_router_daily_and_state(spark, day)
 
-    # 6) CameraIPState (ip_best 30j)
-    update_camera_ip_state(spark, day)
+    # 6) camera daily (camera -> router_id via ip_state) + position du jour
+    step6_camera_daily(spark, day)
 
-    # 7) CameraMaster (position caméra)
-    update_camera_master(spark, day)
+    # 7) camera master (hystérésis)
+    step7_camera_master(spark, day)
 
-# ============================================================
-# RUN EXAMPLE
-# ============================================================
+    # 8) mobilité camera
+    step8_camera_mobility(spark, day)
+
+
+# Exemple:
 # run_daily(spark, "2026-01-13")
