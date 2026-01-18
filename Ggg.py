@@ -1,83 +1,121 @@
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
+from pyspark.sql.types import LongType
 
-# Supposons qu'on a déjà df_joined (Mobile + GPS + Delta calculé)
-# df_joined schema: [camera_id, lat, lon, time_delta, mobile_id]
+# Supposons df_B (Mobiles-Routeurs) et df_C (Mobiles-Geo) chargés.
+# df_A (Cameras-Routeurs) sera utilisé à la fin.
 
 # ==============================================================================
-# ÉTAPE 1 : CLUSTERING SPATIAL (La logique des 20m)
+# ÉTAPE 1 : JOINTURE MOBILES + GEO (Pour localiser les IPs)
 # ==============================================================================
 
-# On crée un "Cluster ID" en arrondissant les coordonnées (approx 11-15m de précision)
-# Cela regroupe naturellement les points proches géographiquement.
-df_clustered = df_joined.withColumn(
-    "lat_grid", F.round(F.col("lat"), 4)
-).withColumn(
-    "lon_grid", F.round(F.col("lon"), 4)
+# On calcule le delta temps absolu
+cond = [
+    df_B.mobile_id == df_C.mobile_id,
+    F.abs(df_B.timestamp - df_C.timestamp) <= 3600 # Fenêtre large 1h pour attraper des candidats
+]
+
+df_observations = df_B.join(df_C, cond) \
+    .select(
+        df_B.ip_router,
+        df_B.timestamp.alias("ts_connection"),
+        df_C.lat,
+        df_C.lon,
+        F.abs(df_B.timestamp - df_C.timestamp).cast(LongType()).alias("delta")
+    )
+
+# On ajoute une colonne temporelle "Bucket" pour l'IP (ex: l'IP est à un endroit fixe par heure)
+df_observations = df_observations.withColumn(
+    "time_bucket", (F.col("ts_connection") / 3600).cast(LongType())
 )
 
-# On calcule les stats pour chaque "Cluster" (Groupe de points au même endroit)
-df_groups = df_clustered.groupBy("camera_id", "lat_grid", "lon_grid").agg(
-    F.count("*").alias("group_size"),             # Taille du groupe
-    F.avg("lat").alias("group_lat"),              # Centroïde du groupe
+# ==============================================================================
+# ÉTAPE 2 : CLUSTERING SPATIAL (Grille de ~11m/20m)
+# ==============================================================================
+# On regroupe les observations d'une même IP (dans la même heure) par zone géographique.
+
+df_grids = df_observations.withColumn("lat_grid", F.round("lat", 4)) \
+                          .withColumn("lon_grid", F.round("lon", 4))
+
+# Calcul des stats par Grille (Zone de 20m)
+df_groups = df_grids.groupBy("ip_router", "time_bucket", "lat_grid", "lon_grid").agg(
+    F.count("*").alias("group_size"),
+    F.avg("lat").alias("group_lat"),
     F.avg("lon").alias("group_lon"),
-    F.stddev("lat").alias("group_dispersion"),    # Dispersion interne (stabilité)
-    F.min("time_delta").alias("group_min_delta")  # Le meilleur delta de ce groupe
+    F.stddev("lat").alias("group_dispersion"), # Null si taille = 1
+    F.min("delta").alias("group_min_delta")
 )
 
-# Gestion des nulls sur la dispersion (si taille groupe = 1, stddev est null -> on met 0)
-df_groups = df_groups.fillna(0, subset=["group_dispersion"])
+# Remplacer null dispersion par une valeur neutre ou infini pour le tri
+df_groups = df_groups.fillna(999, subset=["group_dispersion"])
 
 # ==============================================================================
-# ÉTAPE 2 : SÉLECTION DU MEILLEUR CANDIDAT (Ta logique conditionnelle)
+# ÉTAPE 3 : CLASSEMENT SELON VOTRE LOGIQUE (Le "Ranking")
 # ==============================================================================
 
-# On définit une fenêtre par caméra pour classer les groupes entre eux
-w_camera = Window.partitionBy("camera_id")
+# Définition des priorités (Tiers)
+# 1. PRIORITY_TIER : Les groupes contenant une synchro < 60s sont TOP priorité (Score 2).
+#    Sinon Score 1.
+df_scored = df_groups.withColumn(
+    "priority_tier",
+    F.when(F.col("group_min_delta") <= 60, 2).otherwise(1)
+)
 
-# On définit ta logique de tri complexe ici :
-# Ordre de préférence :
-# 1. D'abord les groupes qui ont une taille > 1 (Validation par la densité)
-# 2. Ensuite, parmi eux, celui qui a la plus petite dispersion (Le plus précis)
-# 3. Si aucun groupe > 1 (que des points isolés), on prend celui avec le plus petit delta temporel.
+# Fenêtre pour trier les groupes d'une même IP
+w_ip = Window.partitionBy("ip_router", "time_bucket")
 
-df_ranked = df_groups.withColumn(
+# LA LOGIQUE DE TRI :
+df_ranked = df_scored.withColumn(
     "rank",
     F.row_number().over(
-        w_camera.orderBy(
-            # Critère A : On veut group_size > 1 en priorité. 
-            # On trie par DESC (True avant False). Si size > 1 c'est 1, sinon 0.
+        w_ip.orderBy(
+            # Critère 1 : On prend d'abord ceux qui ont delta <= 60 (Tier 2 > Tier 1)
+            F.col("priority_tier").desc(),
+
+            # Critère 2 : On préfère les groupes > 1 aux points isolés
             F.when(F.col("group_size") > 1, 1).otherwise(0).desc(),
-            
-            # Critère B : La dispersion minimale (pour les groupes > 1)
-            F.col("group_dispersion").asc(),
-            
-            # Critère C : Le delta temporel (pour départager les singletons ou égalités)
-            F.col("group_min_delta").asc()
+
+            # Critère 3 : Arbitrage final
+            # Si c'est un groupe (size > 1), on veut la plus petite dispersion
+            # Si c'est un point (size = 1), la dispersion est inutile, on veut le plus petit delta
+            # Astuce mathématique pour trier les deux cas en une ligne :
+            F.when(
+                F.col("group_size") > 1, 
+                F.col("group_dispersion") # Si groupe, tri par stabilité
+            ).otherwise(
+                F.col("group_min_delta")  # Si point seul, tri par temps
+            ).asc()
         )
     )
 )
 
-# On ne garde que le "Gagnant" de la logique pour définir la position principale
-df_best_location = df_ranked.filter(F.col("rank") == 1).select(
+# On garde LA meilleure position pour cette IP à cette heure
+df_ip_location = df_ranked.filter(F.col("rank") == 1).select(
+    "ip_router",
+    "time_bucket",
+    F.col("group_lat").alias("ip_lat"),
+    F.col("group_lon").alias("ip_lon"),
+    "priority_tier",   # Pour info utilisateur (2 = Très fiable < 60s)
+    "group_dispersion" # Pour info utilisateur
+)
+
+# ==============================================================================
+# ÉTAPE 4 : JOINTURE AVEC LES CAMÉRAS (Enfin !)
+# ==============================================================================
+
+# On prépare la table A avec le même time_bucket
+df_cameras = spark.table("cameras_router_logs") \
+    .withColumn("time_bucket", (F.col("timestamp") / 3600).cast(LongType()))
+
+# Jointure finale : On attribue à la caméra la position calculée de son IP
+df_final = df_cameras.join(
+    df_ip_location, 
+    on=["ip_router", "time_bucket"], 
+    how="inner" # Inner car si on n'a pas localisé l'IP, on ne peut pas localiser la caméra
+).select(
     "camera_id",
-    F.col("group_lat").alias("final_lat"),
-    F.col("group_lon").alias("final_lon"),
-    F.col("group_min_delta").alias("best_delta"),
-    F.col("group_dispersion").alias("dispersion"),
-    F.col("group_size").alias("nb_points_support")
+    "ip_lat",
+    "ip_lon",
+    "priority_tier",
+    "group_dispersion"
 )
-
-# ==============================================================================
-# ÉTAPE 3 : PRÉPARATION POUR ELASTIC (Attributs pour filtrage)
-# ==============================================================================
-
-# On ajoute des flags booléens pour faciliter les requêtes utilisateurs
-df_elastic_ready = df_best_location.withColumn(
-    "is_high_precision_sync", F.col("best_delta") <= 60 # Tag "Synchro < 1min"
-).withColumn(
-    "is_dense_cluster", F.col("nb_points_support") > 1  # Tag "Confirmé par plusieurs points"
-)
-
-# Résultat à envoyer dans Elastic
-# L'utilisateur pourra faire : "SELECT * FROM cameras WHERE is_high_precision_sync = true"
