@@ -232,3 +232,117 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+from abc import ABC, abstractmethod
+from pyspark.sql import DataFrame
+
+class GeoStrategy(ABC):
+    """
+    Classe abstraite pour toute logique de géolocalisation.
+    """
+    
+    def __init__(self, spark, params):
+        self.spark = spark
+        self.params = params # Dictionnaire contenant les réglages utilisateur (seuils, poids...)
+        self.logic_name = "GENERIC_STRATEGY"
+
+    @abstractmethod
+    def run(self, inputs: dict) -> DataFrame:
+        """
+        inputs: Dictionnaire de DataFrames (A, B, C...)
+        Retourne: DataFrame standardisé [camera_id, lat, lon, confidence, metadata]
+        """
+        pass
+from strategies.base import GeoStrategy
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+class IpInferenceStrategy(GeoStrategy):
+    
+    def __init__(self, spark, params):
+        super().__init__(spark, params)
+        self.logic_name = "IP_INFERENCE"
+
+    def run(self, inputs):
+        # Récupération des paramètres utilisateur
+        decay = float(self.params.get("decay_factor", 0.001))
+        min_witnesses = int(self.params.get("min_witnesses", 2))
+        
+        df_cameras = inputs["cameras"]
+        df_mobiles = inputs["mobiles_net"]
+        df_geo = inputs["mobiles_geo"]
+        
+        # ... [ICI, TOUT LE CODE DE L'ALGO PRÉCÉDENT] ...
+        # (Je ne remets pas tout pour la lisibilité, mais c'est la même logique)
+        
+        # Au moment de calculer le poids :
+        df_weighted = df_best_match.withColumn(
+            "obs_weight",
+            (1.0 / (1.0 + (F.col("time_delta") * decay))) * (100.0 / (F.col("accuracy") + 1.0))
+        )
+        
+        # Filtrage dynamique selon le choix utilisateur
+        df_ip_reliable = df_ip_candidates.filter(F.col("nb_witnesses") >= min_witnesses)
+        
+        # Formatage de la sortie standardisée
+        return df_final_output.select(
+            F.col("camera_id"),
+            F.col("final_lat").alias("lat"),
+            F.col("final_lon").alias("lon"),
+            F.col("user_confidence").alias("confidence"),
+            F.lit(self.logic_name).alias("logic_name"),
+            # On stocke les params utilisés en JSON pour traçabilité
+            F.lit(str(self.params)).alias("params_used_json") 
+        )
+
+
+
+
+import sys
+import json
+from pyspark.sql import SparkSession
+from strategies.ip_inference import IpInferenceStrategy
+# from strategies.image_recognition import ImageStrategy (exemple futur)
+
+def main():
+    spark = SparkSession.builder.appName("GeoLocator_Engine").getOrCreate()
+
+    # 1. Récupération de la Configuration Utilisateur
+    # On imagine que l'UI passe un JSON en argument du job Spark
+    # Ex: '{"active_strategies": ["IP_INFERENCE"], "params": {"IP_INFERENCE": {"decay_factor": 0.005}}}'
+    raw_config = sys.argv[1] 
+    user_config = json.loads(raw_config)
+
+    # 2. Chargement des données brutes (Commun à toutes les stratégies)
+    inputs = {
+        "cameras": spark.table("db.cameras"),
+        "mobiles_net": spark.table("db.mobiles_net"),
+        "mobiles_geo": spark.table("db.mobiles_geo")
+    }
+
+    results_dfs = []
+
+    # 3. Exécution dynamique des stratégies demandées
+    if "IP_INFERENCE" in user_config["active_strategies"]:
+        print(">>> Lancement stratégie IP...")
+        # Injection des paramètres spécifiques à cette algo
+        algo_params = user_config["params"].get("IP_INFERENCE", {})
+        
+        strategy = IpInferenceStrategy(spark, algo_params)
+        results_dfs.append(strategy.run(inputs))
+
+    # if "OTHER_LOGIC" in ...
+    
+    # 4. Unification des résultats
+    if results_dfs:
+        from functools import reduce
+        df_final_all_strategies = reduce(DataFrame.unionByName, results_dfs)
+        
+        # Sauvegarde vers ElasticSearch (Format enrichi)
+        # Chaque ligne contient : CameraID, Lat, Lon, LogicName, ParamsUsed
+        df_final_all_strategies.write.format("es").save("cameras/locations")
+
+if __name__ == "__main__":
+    main()
