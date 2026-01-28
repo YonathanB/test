@@ -199,3 +199,175 @@ Pour 'cam_02' (Le cas ambigu Paris vs Lyon) :
 - Cluster 2 (Lyon) : Score plus faible ou équivalent selon la logique.
 - best_lat/best_lon prendra les coordonnées du Cluster avec le meilleur score.
 """
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+import math
+
+spark = SparkSession.builder.appName("CameraGeolocation_MasterLogic").getOrCreate()
+
+# ==============================================================================
+# 1. PARAMÈTRES DE LOGIQUE MÉTIER
+# ==============================================================================
+CLUSTER_MAX_DIST_METERS = 50.0   # Si > 50m, on crée un nouveau point sur la carte (Ghost)
+STRICT_CONVERGENCE_METERS = 10.0 # Si < 10m, bonus de score (très précis)
+EARTH_RADIUS_KM = 6371.0
+
+# ==============================================================================
+# 2. UDF : LE CERVEAU (Clustering + Scoring)
+# ==============================================================================
+
+def haversine(lat1, lon1, lat2, lon2):
+    """Distance en mètres"""
+    if None in [lat1, lon1, lat2, lon2]: return 0.0
+    dLat = math.radians(lat2 - lat1)
+    dLon = math.radians(lon2 - lon1)
+    a = math.sin(dLat/2) * math.sin(dLat/2) + \
+        math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * \
+        math.sin(dLon/2) * math.sin(dLon/2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return EARTH_RADIUS_KM * c * 1000
+
+def calculate_score(candidates, centroid_lat, centroid_lon):
+    """
+    Calcule le score (0-100) selon tes règles :
+    - Convergence (plusieurs logiques) = Bonus
+    - Proximité (< 10m) = Bonus fort
+    - Dispersion = Malus
+    """
+    n = len(candidates)
+    unique_logics = set(c['source_logic'] for c in candidates)
+    nb_logics = len(unique_logics)
+    
+    # Calcul de la dispersion moyenne (écart au centre)
+    dists = [haversine(centroid_lat, centroid_lon, c['lat'], c['lon']) for c in candidates]
+    avg_spread = sum(dists) / n if n > 0 else 0
+    
+    # --- FORMULE DE SCORING ---
+    score = 40 # Base
+    
+    # 1. Bonus Convergence (Plus on a de sources différentes, plus c'est fiable)
+    score += (nb_logics - 1) * 20 
+    
+    # 2. Bonus/Malus Précision
+    if avg_spread <= STRICT_CONVERGENCE_METERS:
+        score += 20 # Très précis (< 10m)
+    else:
+        # Pénalité : on perd 1 point par mètre au dessus de 10m
+        penalty = (avg_spread - STRICT_CONVERGENCE_METERS) * 0.5
+        score -= penalty
+        
+    return max(0, min(100, int(score))), avg_spread
+
+def master_logic(candidates_list):
+    """
+    Reçoit une liste de points bruts (Daily + History).
+    Retourne une liste de CLUSTERS géographiques distincts.
+    """
+    if not candidates_list: return []
+    
+    # Conversion Row -> Dict
+    points = [row.asDict() if hasattr(row, 'asDict') else row for row in candidates_list]
+    clusters = []
+    
+    # --- ÉTAPE A : CLUSTERING GLOUTON (Séparer Paris de Lyon) ---
+    while points:
+        ref_point = points.pop(0)
+        current_cluster = [ref_point]
+        remaining_points = []
+        
+        for p in points:
+            dist = haversine(ref_point['lat'], ref_point['lon'], p['lat'], p['lon'])
+            if dist <= CLUSTER_MAX_DIST_METERS:
+                current_cluster.append(p)
+            else:
+                remaining_points.append(p)
+        
+        points = remaining_points
+        
+        # --- ÉTAPE B : SCORING DU CLUSTER ---
+        # Centre de gravité
+        avg_lat = sum(x['lat'] for x in current_cluster) / len(current_cluster)
+        avg_lon = sum(x['lon'] for x in current_cluster) / len(current_cluster)
+        
+        score, spread = calculate_score(current_cluster, avg_lat, avg_lon)
+        
+        clusters.append({
+            "lat": avg_lat,
+            "lon": avg_lon,
+            "score": score,
+            "spread_radius": spread,
+            "nb_logics": len(set(x['source_logic'] for x in current_cluster)),
+            "logics": list(set(x['source_logic'] for x in current_cluster)),
+            "count_sources": len(current_cluster)
+        })
+        
+    # On trie les clusters pour que le [0] soit toujours le "Best Choice" (plus haut score)
+    clusters.sort(key=lambda x: x['score'], reverse=True)
+    return clusters
+
+# Schema de sortie complexe (Nested)
+output_schema = ArrayType(StructType([
+    StructField("lat", DoubleType()),
+    StructField("lon", DoubleType()),
+    StructField("score", IntegerType()),
+    StructField("spread_radius", FloatType()),
+    StructField("nb_logics", IntegerType()),
+    StructField("logics", ArrayType(StringType())),
+    StructField("count_sources", IntegerType())
+]))
+
+udf_master_logic = F.udf(master_logic, output_schema)
+
+# ==============================================================================
+# 3. CHARGEMENT ET FUSION (MERGE)
+# ==============================================================================
+
+# A. Charger l'historique (J-1)
+df_history = spark.read.parquet("/data/cameras/history") \
+    .select("camera_id", "source_logic", "lat", "lon", "timestamp")
+
+# B. Charger le daily (J)
+df_daily = spark.read.parquet("/data/cameras/daily_processed") \
+    .select("camera_id", "source_logic", "lat", "lon", "timestamp")
+
+# C. UNION : On met tout dans le même sac
+# C'est ici qu'on "mixe" les logiques.
+df_merged = df_history.union(df_daily)
+
+# ==============================================================================
+# 4. AGRÉGATION ET FORMATAGE FINAL
+# ==============================================================================
+
+# On regroupe TOUT par caméra
+df_grouped = df_merged.groupBy("camera_id").agg(
+    F.collect_list(F.struct("source_logic", "lat", "lon", "timestamp")).alias("raw_data")
+)
+
+# On applique la logique maître
+df_processed = df_grouped.withColumn("clusters", udf_master_logic(F.col("raw_data")))
+
+# On prépare la table finale pour Elasticsearch / UI
+df_final = df_processed.select(
+    F.col("camera_id"),
+    
+    # --- POUR LA GRID (AG Grid) ---
+    # On prend le cluster [0] car c'est le meilleur score (grâce au sort dans l'UDF)
+    F.col("clusters")[0]["lat"].alias("grid_lat"),
+    F.col("clusters")[0]["lon"].alias("grid_lon"),
+    F.col("clusters")[0]["score"].alias("grid_confidence"),
+    
+    # Flag pour dire à l'utilisateur : "Attention, cette caméra est ambiguë"
+    # Si la taille du tableau clusters > 1, ça veut dire qu'elle est vue à 2 endroits > 50m
+    (F.size(F.col("clusters")) > 1).alias("has_location_conflict"),
+    
+    # --- POUR LA CARTE (Map & Zoom) ---
+    # On garde toute la structure imbriquée pour afficher les points multiples au zoom
+    F.col("clusters").alias("map_locations") 
+)
+
+# Sauvegarde
+# df_final.write.format("es").save("cameras_index/_doc")
+
+
