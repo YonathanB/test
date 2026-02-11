@@ -470,63 +470,55 @@ LOGIC_REGISTRY = [
 
 class ConvergenceEngine:
     """
-    Takes outputs from all logics and computes final scored locations.
+    Takes outputs from all logics and produces ONE ROW PER LOGIC PER CAMERA.
+    Every logic result is KEPT. Nothing is dropped.
 
-    Algorithm:
-    1. If mainLogic exists for a camera → score=100, drop all others
-    2. For remaining cameras:
-       a. Cross-compare all logic pairs for that camera
-       b. Count how many logics converge (within CONVERGENCE_RADIUS_METERS)
-       c. Score = base + bonus × (num_converging - 1), capped at MAX_SCORE
-       d. Final location = weighted centroid of converging logics
-       e. Non-converging logics kept but flagged
+    Output columns per row:
+      - camera_id, lat, lon, logic_name            → the logic's own result
+      - final_score                                  → scored (100 for mainLogic)
+      - is_best_location (bool)                      → True for the winning row
+      - convergence_group                            → 'primary'|'alternative'|'isolated'
+      - converges_with         (list of logic names) → which other logics agree
+      - alternative_locations  (list of logic names) → which logics disagree
+      - best_location_logics   (list of logic names) → what the "best" is, for reference
+      - confidence_flag                              → high / medium / low_confidence
+
+    Rules:
+      - mainLogic → score=100, is_best=True. Other logics for that camera
+        are KEPT but marked convergence_group='alternative' and point to
+        mainLogic via best_location_logics. mainLogic also lists them in
+        alternative_locations.
+      - No mainLogic → convergence check. Converging logics form the
+        'primary' group (best). Non-converging logics are 'alternative'.
+        Both sides cross-reference each other.
+      - Camera with only one logic → 'isolated', low confidence.
     """
 
     def __init__(self, config: Config):
         self.config = config
 
     def score_and_merge(self, all_candidates: DataFrame, spark: SparkSession) -> DataFrame:
-        """
-        Main entry point.
-
-        Input:  Union of all logic outputs (LOGIC_OUTPUT_SCHEMA)
-        Output: Scored, deduplicated locations per camera
-                Columns: camera_id, lat, lon, final_score, confidence_flag,
-                         contributing_logics, num_converging_logics, run_date
-        """
         config = self.config
 
-        # ── STEP A: Separate mainLogic cameras ──────────────────────────
-        main_cameras = (
-            all_candidates
-            .filter(F.col("logic_name") == config.MAIN_LOGIC_NAME)
-            .withColumn("final_score", F.lit(config.MAIN_LOGIC_SCORE))
-            .withColumn("confidence_flag", F.lit("high"))
-            .withColumn("contributing_logics", F.lit(config.MAIN_LOGIC_NAME))
-            .withColumn("num_converging_logics", F.lit(1))
-            .select("camera_id", "lat", "lon", "final_score",
-                    "confidence_flag", "contributing_logics",
-                    "num_converging_logics")
+        # =================================================================
+        # PHASE 1: Assign a unique row_id to every candidate
+        # =================================================================
+        candidates = all_candidates.withColumn(
+            "row_id",
+            F.monotonically_increasing_id()
         )
 
-        main_camera_ids = main_cameras.select("camera_id").distinct()
-
-        # ── STEP B: All other cameras (no mainLogic) ───────────────────
-        other_candidates = (
-            all_candidates
-            .join(main_camera_ids, "camera_id", "left_anti")
-        )
-
-        # ── STEP C: Pairwise convergence check ─────────────────────────
-        # Self-join: for each camera, compare every pair of logics
-        left = other_candidates.alias("a")
-        right = other_candidates.alias("b")
+        # =================================================================
+        # PHASE 2: Pairwise distances (ALL logics, ALL cameras)
+        # =================================================================
+        left = candidates.alias("a")
+        right = candidates.alias("b")
 
         pairs = (
             left.join(
                 right,
                 (F.col("a.camera_id") == F.col("b.camera_id"))
-                & (F.col("a.logic_name") < F.col("b.logic_name")),  # avoid duplicates
+                & (F.col("a.row_id") < F.col("b.row_id")),
                 "inner"
             )
             .withColumn(
@@ -537,123 +529,308 @@ class ConvergenceEngine:
                 )
             )
             .withColumn(
-                "is_converging",
-                (F.col("distance_m") <= config.CONVERGENCE_RADIUS_METERS).cast(IntegerType())
+                "within_radius",
+                F.col("distance_m") <= config.CONVERGENCE_RADIUS_METERS
             )
-        )
-
-        # ── STEP D: For each logic per camera, count convergences ──────
-        # A logic "converges" if it's within radius of at least one other logic
-
-        convergence_a = (
-            pairs
-            .filter(F.col("is_converging") == 1)
             .select(
                 F.col("a.camera_id").alias("camera_id"),
-                F.col("a.logic_name").alias("logic_name"),
+                F.col("a.logic_name").alias("logic_a"),
+                F.col("b.logic_name").alias("logic_b"),
+                "distance_m",
+                "within_radius",
             )
         )
-        convergence_b = (
-            pairs
-            .filter(F.col("is_converging") == 1)
+
+        # =================================================================
+        # PHASE 3: Build "converges_with" and "diverges_from" per logic
+        # =================================================================
+
+        # Converging pairs (bidirectional)
+        conv_from_a = (
+            pairs.filter(F.col("within_radius"))
             .select(
-                F.col("b.camera_id").alias("camera_id"),
-                F.col("b.logic_name").alias("logic_name"),
+                "camera_id",
+                F.col("logic_a").alias("logic_name"),
+                F.col("logic_b").alias("converges_with_logic"),
             )
         )
-        converging_logics = convergence_a.unionByName(convergence_b).distinct()
-
-        # Tag each candidate as converging or not
-        other_tagged = (
-            other_candidates.alias("oc")
-            .join(
-                converging_logics.alias("cv"),
-                (F.col("oc.camera_id") == F.col("cv.camera_id"))
-                & (F.col("oc.logic_name") == F.col("cv.logic_name")),
-                "left"
-            )
-            .withColumn(
-                "is_converging",
-                F.when(F.col("cv.logic_name").isNotNull(), F.lit(True))
-                 .otherwise(F.lit(False))
-            )
+        conv_from_b = (
+            pairs.filter(F.col("within_radius"))
             .select(
-                F.col("oc.camera_id"),
-                F.col("oc.lat"),
-                F.col("oc.lon"),
-                F.col("oc.logic_name"),
-                F.col("oc.logic_confidence"),
-                F.col("oc.num_evidence_points"),
-                "is_converging",
+                "camera_id",
+                F.col("logic_b").alias("logic_name"),
+                F.col("logic_a").alias("converges_with_logic"),
+            )
+        )
+        all_convergences = conv_from_a.unionByName(conv_from_b)
+
+        # Diverging pairs (bidirectional)
+        div_from_a = (
+            pairs.filter(~F.col("within_radius"))
+            .select(
+                "camera_id",
+                F.col("logic_a").alias("logic_name"),
+                F.col("logic_b").alias("diverges_from_logic"),
+            )
+        )
+        div_from_b = (
+            pairs.filter(~F.col("within_radius"))
+            .select(
+                "camera_id",
+                F.col("logic_b").alias("logic_name"),
+                F.col("logic_a").alias("diverges_from_logic"),
+            )
+        )
+        all_divergences = div_from_a.unionByName(div_from_b)
+
+        # Aggregate per (camera_id, logic_name)
+        conv_agg = (
+            all_convergences
+            .groupBy("camera_id", "logic_name")
+            .agg(
+                F.collect_set("converges_with_logic").alias("converges_with"),
+                F.count("*").alias("num_converging"),
             )
         )
 
-        # ── STEP E: Per-camera scoring ─────────────────────────────────
-        # For cameras WITH convergence: weighted centroid of converging logics
-        converging_only = other_tagged.filter(F.col("is_converging") == True)
+        div_agg = (
+            all_divergences
+            .groupBy("camera_id", "logic_name")
+            .agg(
+                F.collect_set("diverges_from_logic").alias("diverges_from"),
+            )
+        )
 
-        scored_converging = (
-            converging_only
+        # =================================================================
+        # PHASE 4: Enrich every candidate row
+        # =================================================================
+        enriched = (
+            candidates
+            .join(conv_agg, ["camera_id", "logic_name"], "left")
+            .join(div_agg, ["camera_id", "logic_name"], "left")
+            .withColumn("converges_with",
+                        F.coalesce(F.col("converges_with"), F.array()))
+            .withColumn("diverges_from",
+                        F.coalesce(F.col("diverges_from"), F.array()))
+            .withColumn("num_converging",
+                        F.coalesce(F.col("num_converging"), F.lit(0)))
+        )
+
+        # =================================================================
+        # PHASE 5: Determine best location group per camera
+        # =================================================================
+        # Count logics per camera
+        logic_count_per_camera = (
+            candidates
+            .groupBy("camera_id")
+            .agg(F.count("*").alias("total_logics_for_camera"))
+        )
+        enriched = enriched.join(logic_count_per_camera, "camera_id", "left")
+
+        # Has mainLogic?
+        has_main = (
+            candidates
+            .filter(F.col("logic_name") == config.MAIN_LOGIC_NAME)
+            .select("camera_id")
+            .distinct()
+            .withColumn("has_main_logic", F.lit(True))
+        )
+        enriched = (
+            enriched
+            .join(has_main, "camera_id", "left")
+            .withColumn("has_main_logic",
+                        F.coalesce(F.col("has_main_logic"), F.lit(False)))
+        )
+
+        # For cameras WITHOUT mainLogic: find the "primary" group
+        # = the largest set of mutually converging logics
+        # Approximation: the logic with the most convergences anchors the group
+        best_convergence_per_camera = (
+            enriched
+            .filter(~F.col("has_main_logic"))
+            .groupBy("camera_id")
+            .agg(F.max("num_converging").alias("max_converging"))
+        )
+
+        # All logics in the "primary" cluster = those that converge with
+        # the best-connected logic (or are the best-connected logic)
+        primary_anchor = (
+            enriched
+            .filter(~F.col("has_main_logic"))
+            .join(best_convergence_per_camera, "camera_id", "inner")
+            .filter(
+                (F.col("num_converging") == F.col("max_converging"))
+                & (F.col("num_converging") > 0)
+            )
             .groupBy("camera_id")
             .agg(
-                # Weighted centroid (weight = logic_confidence × evidence)
-                (F.sum(F.col("lat") * F.col("logic_confidence"))
-                 / F.sum("logic_confidence")).alias("lat"),
-                (F.sum(F.col("lon") * F.col("logic_confidence"))
-                 / F.sum("logic_confidence")).alias("lon"),
-                F.count("*").alias("num_converging_logics"),
-                F.concat_ws(",", F.collect_set("logic_name")).alias("contributing_logics"),
+                # Collect all logics that are part of the best convergence cluster
+                F.array_distinct(
+                    F.flatten(
+                        F.array(
+                            F.collect_set("logic_name"),
+                            F.flatten(F.collect_list("converges_with"))
+                        )
+                    )
+                ).alias("primary_logics")
             )
+        )
+
+        enriched = enriched.join(primary_anchor, "camera_id", "left")
+
+        # =================================================================
+        # PHASE 6: Assign convergence_group, score, cross-references
+        # =================================================================
+        scored = (
+            enriched
             .withColumn(
-                "final_score",
+                "convergence_group",
+                F.when(
+                    # mainLogic cameras: mainLogic is primary, others are alternative
+                    F.col("has_main_logic") & (F.col("logic_name") == config.MAIN_LOGIC_NAME),
+                    F.lit("primary")
+                ).when(
+                    F.col("has_main_logic") & (F.col("logic_name") != config.MAIN_LOGIC_NAME),
+                    F.lit("alternative")
+                ).when(
+                    # No mainLogic: check if this logic is in the primary cluster
+                    F.col("primary_logics").isNotNull()
+                    & F.array_contains(F.col("primary_logics"), F.col("logic_name")),
+                    F.lit("primary")
+                ).when(
+                    # No mainLogic, not in primary cluster, but primary cluster exists
+                    F.col("primary_logics").isNotNull(),
+                    F.lit("alternative")
+                ).otherwise(
+                    # No convergence at all (solo logic or all logics diverge)
+                    F.lit("isolated")
+                )
+            )
+        )
+
+        # Score
+        scored = scored.withColumn(
+            "final_score",
+            F.when(
+                F.col("logic_name") == config.MAIN_LOGIC_NAME,
+                F.lit(config.MAIN_LOGIC_SCORE)
+            ).when(
+                F.col("convergence_group") == "primary",
                 F.least(
                     F.lit(config.MAX_SCORE_WITHOUT_MAIN),
                     F.lit(config.BASE_SCORE_SINGLE_LOGIC)
-                    + F.lit(config.CONVERGENCE_BONUS_PER_LOGIC)
-                      * (F.col("num_converging_logics") - 1)
+                    + F.lit(config.CONVERGENCE_BONUS_PER_LOGIC) * F.col("num_converging")
+                )
+            ).when(
+                F.col("convergence_group") == "alternative",
+                F.lit(config.BASE_SCORE_SINGLE_LOGIC)  # kept but low score
+            ).otherwise(
+                F.lit(config.BASE_SCORE_SINGLE_LOGIC)  # isolated
+            )
+        )
+
+        # is_best_location: True for the highest-scored row per camera
+        best_w = Window.partitionBy("camera_id").orderBy(
+            F.desc("final_score"), F.desc("logic_confidence"), F.desc("num_evidence_points")
+        )
+        scored = (
+            scored
+            .withColumn("_rank", F.row_number().over(best_w))
+            .withColumn("is_best_location", F.col("_rank") == 1)
+        )
+
+        # =================================================================
+        # PHASE 7: Cross-references (bidirectional)
+        # =================================================================
+
+        # For each row, collect the names of logics in the OTHER group(s)
+        # "alternative_locations" = logics that located this camera elsewhere
+        # "best_location_logics" = which logics form the best location
+
+        # Build best-location logics per camera
+        best_logics_per_camera = (
+            scored
+            .filter(F.col("convergence_group") == "primary")
+            .groupBy("camera_id")
+            .agg(F.collect_set("logic_name").alias("best_location_logics"))
+        )
+
+        # Build alternative logics per camera
+        alt_logics_per_camera = (
+            scored
+            .filter(F.col("convergence_group").isin("alternative", "isolated"))
+            .groupBy("camera_id")
+            .agg(F.collect_set("logic_name").alias("alternative_location_logics"))
+        )
+
+        scored = (
+            scored
+            .join(best_logics_per_camera, "camera_id", "left")
+            .join(alt_logics_per_camera, "camera_id", "left")
+        )
+
+        # Now assign the cross-reference columns depending on which group this row is in
+        scored = (
+            scored
+            .withColumn(
+                "alternative_locations",
+                F.when(
+                    F.col("convergence_group") == "primary",
+                    F.coalesce(F.col("alternative_location_logics"), F.array())
+                ).otherwise(
+                    # For alternative/isolated rows: "the best location is from these logics"
+                    F.array()  # they don't point to other alternatives, they point to best
                 )
             )
-            .withColumn("confidence_flag",
-                F.when(F.col("num_converging_logics") >= 3, F.lit("high"))
-                 .when(F.col("num_converging_logics") == 2, F.lit("medium"))
-                 .otherwise(F.lit("low"))
+            .withColumn(
+                "best_location_logics",
+                F.when(
+                    F.col("convergence_group").isin("alternative", "isolated"),
+                    F.coalesce(F.col("best_location_logics"), F.array())
+                ).otherwise(
+                    F.array()  # primary rows don't need to reference themselves
+                )
             )
-            .select("camera_id", "lat", "lon", "final_score",
-                    "confidence_flag", "contributing_logics",
-                    "num_converging_logics")
         )
 
-        # For cameras with NO convergence: keep best single logic, flag low
-        cameras_with_convergence = scored_converging.select("camera_id").distinct()
-
-        non_converging_cameras = (
-            other_tagged
-            .join(cameras_with_convergence, "camera_id", "left_anti")
+        # Confidence flag
+        scored = scored.withColumn(
+            "confidence_flag",
+            F.when(F.col("logic_name") == config.MAIN_LOGIC_NAME, F.lit("high"))
+             .when((F.col("convergence_group") == "primary") & (F.col("num_converging") >= 2),
+                   F.lit("high"))
+             .when((F.col("convergence_group") == "primary") & (F.col("num_converging") == 1),
+                   F.lit("medium"))
+             .when(F.col("convergence_group") == "alternative", F.lit("low_confidence"))
+             .otherwise(F.lit("low_confidence"))
         )
 
-        # Pick the logic with the highest confidence for non-converging cameras
-        best_single_w = Window.partitionBy("camera_id").orderBy(
-            F.desc("logic_confidence"), F.desc("num_evidence_points")
-        )
-
-        scored_non_converging = (
-            non_converging_cameras
-            .withColumn("rn", F.row_number().over(best_single_w))
-            .filter(F.col("rn") == 1)
-            .withColumn("final_score", F.lit(config.BASE_SCORE_SINGLE_LOGIC))
-            .withColumn("confidence_flag", F.lit("low_confidence"))
-            .withColumn("contributing_logics", F.col("logic_name"))
-            .withColumn("num_converging_logics", F.lit(1))
-            .select("camera_id", "lat", "lon", "final_score",
-                    "confidence_flag", "contributing_logics",
-                    "num_converging_logics")
-        )
-
-        # ── STEP F: Union all ──────────────────────────────────────────
+        # =================================================================
+        # PHASE 8: Final select — clean output
+        # =================================================================
         final = (
-            main_cameras
-            .unionByName(scored_converging)
-            .unionByName(scored_non_converging)
+            scored
+            .withColumn("converges_with_str", F.concat_ws(",", "converges_with"))
+            .withColumn("alternative_locations_str", F.concat_ws(",", "alternative_locations"))
+            .withColumn("best_location_logics_str", F.concat_ws(",", "best_location_logics"))
+            .select(
+                "camera_id",
+                "lat",
+                "lon",
+                "logic_name",
+                "logic_confidence",
+                "num_evidence_points",
+                "final_score",
+                "is_best_location",
+                "convergence_group",
+                F.col("converges_with_str").alias("converges_with"),
+                F.col("alternative_locations_str").alias("alternative_locations"),
+                F.col("best_location_logics_str").alias("best_location_logics"),
+                "num_converging",
+                "total_logics_for_camera",
+                "confidence_flag",
+                "metadata",
+            )
         )
 
         return final
@@ -664,32 +841,65 @@ class ConvergenceEngine:
 # =============================================================================
 
 def merge_to_gold(silver_df, spark, config=Config):
-    """Upsert: keep the higher final_score per camera."""
+    """
+    Gold table keeps ALL rows (every logic for every camera).
+    Merge strategy: for each camera, compare the BEST score in silver
+    vs the BEST score in gold. If silver is better (or camera is new),
+    replace ALL rows for that camera with silver's rows.
+    Otherwise keep gold's rows.
+
+    This ensures the gold table always has the complete picture
+    (all logics + cross-references) from the best-scoring run.
+    """
     try:
         gold_df = spark.read.parquet(config.GOLD_PATH)
     except Exception:
         silver_df.write.mode("overwrite").parquet(config.GOLD_PATH)
+        print("[GOLD] Initialized Gold table from Silver.")
         return silver_df
 
-    merged = (
-        gold_df.alias("g")
-        .join(silver_df.alias("s"), F.col("g.camera_id") == F.col("s.camera_id"), "full_outer")
+    # Best score per camera in each table
+    gold_best = (
+        gold_df
+        .groupBy("camera_id")
+        .agg(F.max("final_score").alias("gold_best_score"))
+    )
+    silver_best = (
+        silver_df
+        .groupBy("camera_id")
+        .agg(F.max("final_score").alias("silver_best_score"))
     )
 
-    columns = silver_df.columns
-
-    final = merged.select(
-        *[
-            F.when(F.col("g.camera_id").isNull(), F.col(f"s.{c}"))
-             .when(F.col("s.camera_id").isNull(), F.col(f"g.{c}"))
-             .when(F.col("s.final_score") > F.col("g.final_score"), F.col(f"s.{c}"))
-             .otherwise(F.col(f"g.{c}"))
-             .alias(c)
-            for c in columns
-        ]
+    # Decide per camera: take silver or keep gold?
+    comparison = (
+        gold_best.alias("g")
+        .join(silver_best.alias("s"), "camera_id", "full_outer")
+        .withColumn(
+            "winner",
+            F.when(F.col("gold_best_score").isNull(), F.lit("silver"))  # new camera
+             .when(F.col("silver_best_score").isNull(), F.lit("gold"))  # no new data
+             .when(F.col("silver_best_score") > F.col("gold_best_score"), F.lit("silver"))
+             .otherwise(F.lit("gold"))
+        )
+        .select("camera_id", "winner")
     )
+
+    # Cameras where silver wins → take all silver rows
+    silver_winners = comparison.filter(F.col("winner") == "silver").select("camera_id")
+    silver_rows = silver_df.join(silver_winners, "camera_id", "inner")
+
+    # Cameras where gold wins → keep all gold rows
+    gold_winners = comparison.filter(F.col("winner") == "gold").select("camera_id")
+    gold_rows = gold_df.join(gold_winners, "camera_id", "inner")
+
+    # Union
+    final = gold_rows.unionByName(silver_rows, allowMissingColumns=True)
 
     final.write.mode("overwrite").parquet(config.GOLD_PATH)
+    distinct_cameras = final.select("camera_id").distinct().count()
+    total_rows = final.count()
+    print(f"[GOLD] Merged. {distinct_cameras} cameras, {total_rows} total rows.")
+
     return final
 
 
@@ -743,10 +953,32 @@ def run_pipeline(run_date, config=Config):
 
     # Print summary
     print("\n  ── Results Summary ──")
-    silver.groupBy("confidence_flag").agg(
-        F.count("*").alias("cameras"),
+    distinct_cameras = silver.select("camera_id").distinct().count()
+    total_rows = silver.count()
+    print(f"  Cameras: {distinct_cameras}, Total logic rows: {total_rows}")
+
+    print("\n  By convergence group:")
+    silver.groupBy("convergence_group").agg(
+        F.count("*").alias("rows"),
+        F.countDistinct("camera_id").alias("cameras"),
         F.round(F.avg("final_score"), 1).alias("avg_score"),
     ).show()
+
+    print("  By confidence flag:")
+    silver.groupBy("confidence_flag").agg(
+        F.count("*").alias("rows"),
+        F.round(F.avg("final_score"), 1).alias("avg_score"),
+    ).show()
+
+    # Show cameras that have alternative locations
+    cameras_with_alternatives = (
+        silver
+        .filter(F.col("alternative_locations") != "")
+        .select("camera_id")
+        .distinct()
+        .count()
+    )
+    print(f"  Cameras with alternative locations flagged: {cameras_with_alternatives}")
 
     # ── Write Silver ────────────────────────────────────────────────────
     silver.write.mode("overwrite").parquet(
