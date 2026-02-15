@@ -594,36 +594,96 @@ class ConvergenceEngine:
         )
 
         # =================================================================
-        # PHASE 5: Find primary cluster per camera (without mainLogic)
+        # PHASE 5: Connected components — find ALL clusters per camera
         # =================================================================
-        # Anchor = logic with the most convergences
-        best_conv = (
-            enriched.filter(~F.col("has_main_logic"))
-            .groupBy("camera_id")
-            .agg(F.max("num_converging").alias("max_converging"))
+        # A cluster = a connected component in the convergence graph.
+        # A↔B and C↔D = two separate clusters. E alone = isolated.
+        #
+        # Algorithm: iterative label propagation on convergence pairs.
+        # Each logic starts with its own name as label. On each iteration,
+        # every logic takes the MIN label among itself and its neighbors.
+        # Converges in at most N iterations (N = number of logics per camera).
+        # In practice 5-10 iterations is plenty.
+
+        # Start: every logic that converges with someone
+        converging_logics = (
+            all_convergences
+            .select("camera_id", F.col("logic_name").alias("node"))
+            .distinct()
         )
 
-        primary_anchor = (
-            enriched.filter(~F.col("has_main_logic"))
-            .join(best_conv, "camera_id", "inner")
-            .filter(
-                (F.col("num_converging") == F.col("max_converging"))
-                & (F.col("num_converging") > 0)
-            )
-            .groupBy("camera_id")
-            .agg(
-                F.array_distinct(
-                    F.flatten(F.array(
-                        F.collect_set("logic_name"),
-                        F.flatten(F.collect_list("converges_with"))
-                    ))
-                ).alias("primary_logics")
+        # Initialize label = logic_name (alphabetical min will propagate)
+        labels = converging_logics.withColumn("cluster_id", F.col("node"))
+
+        # Build edge list (bidirectional, already done in all_convergences)
+        edges = (
+            all_convergences
+            .select(
+                "camera_id",
+                F.col("logic_name").alias("node"),
+                F.col("converges_with_logic").alias("neighbor")
             )
         )
 
-        enriched = enriched.join(primary_anchor, "camera_id", "left")
+        # Iterate: propagate min label through edges
+        MAX_ITERATIONS = 10
+        for _ in range(MAX_ITERATIONS):
+            # Join labels to neighbors
+            neighbor_labels = (
+                edges.alias("e")
+                .join(
+                    labels.alias("l"),
+                    (F.col("e.camera_id") == F.col("l.camera_id"))
+                    & (F.col("e.neighbor") == F.col("l.node")),
+                    "inner"
+                )
+                .select(
+                    F.col("e.camera_id"),
+                    F.col("e.node"),
+                    F.col("l.cluster_id").alias("neighbor_label")
+                )
+            )
 
-        # Tag each logic as primary / alternative / isolated
+            # For each node: min of own label and all neighbor labels
+            new_labels = (
+                labels
+                .unionByName(
+                    neighbor_labels.select(
+                        "camera_id",
+                        "node",
+                        F.col("neighbor_label").alias("cluster_id")
+                    )
+                )
+                .groupBy("camera_id", "node")
+                .agg(F.min("cluster_id").alias("cluster_id"))
+            )
+
+            labels = new_labels
+
+        # Now labels has: (camera_id, node=logic_name, cluster_id)
+        # cluster_id is the same for all logics in the same connected component
+
+        # =================================================================
+        # PHASE 5b: Assign roles
+        # =================================================================
+
+        # Join cluster_id back to enriched
+        enriched = (
+            enriched
+            .join(
+                labels.select(
+                    F.col("camera_id").alias("_cc_cam"),
+                    F.col("node").alias("_cc_logic"),
+                    "cluster_id"
+                ),
+                (F.col("camera_id") == F.col("_cc_cam"))
+                & (F.col("logic_name") == F.col("_cc_logic")),
+                "left"
+            )
+            .drop("_cc_cam", "_cc_logic")
+        )
+
+        # Assign role
         enriched = enriched.withColumn(
             "role",
             F.when(
@@ -633,14 +693,10 @@ class ConvergenceEngine:
                 F.col("has_main_logic") & (F.col("logic_name") != config.MAIN_LOGIC_NAME),
                 F.lit("alternative")
             ).when(
-                F.col("primary_logics").isNotNull()
-                & F.array_contains(F.col("primary_logics"), F.col("logic_name")),
-                F.lit("primary_member")
-            ).when(
-                F.col("primary_logics").isNotNull(),
-                F.lit("alternative")
+                F.col("cluster_id").isNotNull(),
+                F.lit("cluster_member")   # belongs to some convergence cluster
             ).otherwise(
-                F.lit("isolated")
+                F.lit("isolated")         # no convergence with anyone
             )
         )
 
@@ -648,7 +704,6 @@ class ConvergenceEngine:
         # PHASE 6: Build output rows
         # =================================================================
 
-        # Helper: build a struct with the logic's individual detail
         def _logic_detail_struct():
             return F.struct(
                 F.col("logic_name").alias("logic"),
@@ -656,7 +711,6 @@ class ConvergenceEngine:
                 "num_evidence_points", "metadata"
             )
 
-        # Add detail struct to all enriched rows (used by A, C, D)
         enriched = enriched.withColumn("_detail", _logic_detail_struct())
 
         # ── A) mainLogic rows ───────────────────────────────────────────
@@ -665,7 +719,6 @@ class ConvergenceEngine:
             .select(
                 "camera_id", "lat", "lon",
                 F.col("logic_name").alias("contributing_logics"),
-                "logic_confidence", "num_evidence_points",
                 F.lit(config.MAIN_LOGIC_SCORE).alias("final_score"),
                 F.lit(True).alias("is_best_location"),
                 F.lit("primary").alias("convergence_group"),
@@ -676,10 +729,10 @@ class ConvergenceEngine:
             )
         )
 
-        # ── B) Primary cluster → FUSED (weighted centroid) ──────────────
-        fused_primary = (
-            enriched.filter(F.col("role") == "primary_member")
-            .groupBy("camera_id", "total_logics_for_camera")
+        # ── B) Cluster members → one fused row PER CLUSTER ─────────────
+        fused_clusters = (
+            enriched.filter(F.col("role") == "cluster_member")
+            .groupBy("camera_id", "cluster_id", "total_logics_for_camera")
             .agg(
                 (F.sum(F.col("lat") * F.col("logic_confidence"))
                  / F.sum("logic_confidence")).alias("lat"),
@@ -687,8 +740,6 @@ class ConvergenceEngine:
                  / F.sum("logic_confidence")).alias("lon"),
                 F.concat_ws(",", F.sort_array(F.collect_set("logic_name")))
                     .alias("contributing_logics"),
-                F.max("logic_confidence").alias("logic_confidence"),
-                F.sum("num_evidence_points").alias("num_evidence_points"),
                 F.count("*").alias("num_contributing_logics"),
                 F.collect_list("_detail").alias("logic_details"),
             )
@@ -710,20 +761,18 @@ class ConvergenceEngine:
             )
             .select(
                 "camera_id", "lat", "lon", "contributing_logics",
-                "logic_confidence", "num_evidence_points", "final_score",
-                "is_best_location", "convergence_group",
+                "final_score", "is_best_location", "convergence_group",
                 "num_contributing_logics", "total_logics_for_camera",
                 "confidence_flag", "logic_details",
             )
         )
 
-        # ── C) Alternative rows ─────────────────────────────────────────
+        # ── C) Alternative rows (has mainLogic, not mainLogic itself) ───
         alternative_rows = (
             enriched.filter(F.col("role") == "alternative")
             .select(
                 "camera_id", "lat", "lon",
                 F.col("logic_name").alias("contributing_logics"),
-                "logic_confidence", "num_evidence_points",
                 F.lit(config.BASE_SCORE_SINGLE_LOGIC).alias("final_score"),
                 F.lit(False).alias("is_best_location"),
                 F.lit("alternative").alias("convergence_group"),
@@ -740,7 +789,6 @@ class ConvergenceEngine:
             .select(
                 "camera_id", "lat", "lon",
                 F.col("logic_name").alias("contributing_logics"),
-                "logic_confidence", "num_evidence_points",
                 F.lit(config.BASE_SCORE_SINGLE_LOGIC).alias("final_score"),
                 F.lit(True).alias("is_best_location"),
                 F.lit("isolated").alias("convergence_group"),
@@ -756,7 +804,7 @@ class ConvergenceEngine:
         # =================================================================
         all_rows = (
             main_rows
-            .unionByName(fused_primary)
+            .unionByName(fused_clusters)
             .unionByName(alternative_rows)
             .unionByName(isolated_rows)
         )
@@ -764,57 +812,46 @@ class ConvergenceEngine:
         # =================================================================
         # PHASE 8: Cross-references (bidirectional)
         # =================================================================
+        # Each row lists ALL other rows for the same camera as
+        # "other_locations". Primary rows see other primaries + alternatives.
+        # Alternatives/isolated see all primaries.
 
-        # Primary/main logics per camera
-        best_per_camera = (
+        # Collect all contributing_logics per camera
+        all_logics_per_camera = (
             all_rows
-            .filter(F.col("convergence_group") == "primary")
             .groupBy("camera_id")
-            .agg(F.concat_ws(",", F.collect_set("contributing_logics"))
-                  .alias("_best_logics"))
+            .agg(F.collect_set("contributing_logics").alias("_all_logics"))
         )
 
-        # Alternative logics per camera
-        alt_per_camera = (
-            all_rows
-            .filter(F.col("convergence_group").isin("alternative", "isolated"))
-            .groupBy("camera_id")
-            .agg(F.concat_ws(",", F.collect_set("contributing_logics"))
-                  .alias("_alt_logics"))
-        )
+        all_rows = all_rows.join(all_logics_per_camera, "camera_id", "left")
 
-        all_rows = (
-            all_rows
-            .join(best_per_camera, "camera_id", "left")
-            .join(alt_per_camera, "camera_id", "left")
-        )
-
-        # Assign cross-refs based on group
-        all_rows = (
-            all_rows
-            .withColumn(
-                "alternative_locations",
-                F.when(F.col("convergence_group") == "primary",
-                       F.coalesce(F.col("_alt_logics"), F.lit("")))
-                 .otherwise(F.lit(""))
-            )
-            .withColumn(
-                "best_location_logics",
-                F.when(F.col("convergence_group").isin("alternative", "isolated"),
-                       F.coalesce(F.col("_best_logics"), F.lit("")))
-                 .otherwise(F.lit(""))
+        # other_locations = all logics for this camera MINUS this row's own logics
+        all_rows = all_rows.withColumn(
+            "other_locations",
+            F.concat_ws(",",
+                F.array_except(F.col("_all_logics"),
+                               F.array(F.col("contributing_logics")))
             )
         )
 
-        # Fix is_best_location: only 1 True per camera
-        best_w = Window.partitionBy("camera_id").orderBy(
-            F.desc("final_score"), F.desc("logic_confidence"),
-            F.desc("num_evidence_points")
+        # is_best_location: all primary rows are True
+        # isolated = True ONLY if no primary exists for this camera
+        has_primary = (
+            all_rows.filter(F.col("convergence_group") == "primary")
+            .select("camera_id").distinct()
+            .withColumn("_has_primary", F.lit(True))
         )
         all_rows = (
-            all_rows
-            .withColumn("_rank", F.row_number().over(best_w))
-            .withColumn("is_best_location", F.col("_rank") == 1)
+            all_rows.join(has_primary, "camera_id", "left")
+            .withColumn("_has_primary",
+                        F.coalesce(F.col("_has_primary"), F.lit(False)))
+            .withColumn(
+                "is_best_location",
+                F.when(F.col("convergence_group") == "primary", F.lit(True))
+                 .when(~F.col("_has_primary") & (F.col("convergence_group") == "isolated"),
+                       F.lit(True))
+                 .otherwise(F.lit(False))
+            )
         )
 
         # =================================================================
@@ -828,8 +865,7 @@ class ConvergenceEngine:
             "final_score",
             "is_best_location",
             "convergence_group",
-            "alternative_locations",
-            "best_location_logics",
+            "other_locations",
             "num_contributing_logics",
             "total_logics_for_camera",
             "confidence_flag",
