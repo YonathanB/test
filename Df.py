@@ -1,691 +1,1006 @@
-# ==============================================================================
-# 0. IMPORTS ET CONFIGURATION
-# ==============================================================================
-from pyspark.sql import SparkSession
+"""
+Multi-Logic Camera Geolocation Framework
+==========================================
+Extensible framework where N independent localization logics each produce
+candidate locations for cameras. A convergence engine scores results based
+on how many logics agree.
+
+Rules:
+  - mainLogic fires → score = 100, all other logics for that camera are DROPPED
+  - Otherwise: all logics kept, convergence within a radius boosts score
+  - Non-converging cameras flagged as 'low_confidence'
+
+Usage:
+  spark-submit multi_logic_geolocation.py --date 2025-06-15
+
+Adding a new logic:
+  1. Create a class that extends BaseLocalizationLogic
+  2. Implement the `run()` method → returns DataFrame[camera_id, lat, lon, logic_name, ...]
+  3. Register it in the LOGIC_REGISTRY
+"""
+
+from abc import ABC, abstractmethod
+from pyspark.sql import SparkSession, DataFrame, Window
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
-from pyspark.sql.types import *
+from pyspark.sql.types import (
+    StructType, StructField, StringType, DoubleType,
+    IntegerType, FloatType, DateType, TimestampType
+)
 import math
+from datetime import datetime
+import argparse
 
-# Initialisation de la session
-spark = SparkSession.builder \
-    .appName("Camera_Geolocation_Master_Pipeline") \
-    .getOrCreate()
 
-# --- CONSTANTES MÉTIER ---
-EARTH_RADIUS_KM = 6371.0
-CLUSTER_THRESHOLD_METERS = 50.0  # Distance max pour grouper des points (Fusion)
-HIGH_PRECISION_METERS = 10.0     # En-dessous de 10m, on considère la précision excellente
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
-# ==============================================================================
-# 1. DÉFINITION DES FONCTIONS UDF (L'INTELLIGENCE GÉOGRAPHIQUE)
-# ==============================================================================
+class Config:
+    # Convergence radius in meters — two logics agreeing within this = convergence
+    CONVERGENCE_RADIUS_METERS = 100
 
-def haversine(lat1, lon1, lat2, lon2):
-    """Calcule la distance en mètres entre deux coordonnées GPS."""
-    if None in [lat1, lon1, lat2, lon2]: return 0.0
-    
-    dLat = math.radians(lat2 - lat1)
-    dLon = math.radians(lon2 - lon1)
-    a = math.sin(dLat/2) * math.sin(dLat/2) + \
-        math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * \
-        math.sin(dLon/2) * math.sin(dLon/2)
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return EARTH_RADIUS_KM * c * 1000
+    # Scoring
+    MAIN_LOGIC_SCORE = 100.0          # mainLogic always gets this score
+    BASE_SCORE_SINGLE_LOGIC = 20.0    # one logic alone, no convergence
+    CONVERGENCE_BONUS_PER_LOGIC = 15.0 # bonus per additional converging logic
+    MAX_SCORE_WITHOUT_MAIN = 85.0     # cap — only mainLogic can reach 100
 
-def process_geolocation_logic(candidates):
-    """
-    Cette fonction reçoit la liste de toutes les positions actives pour une caméra.
-    Elle effectue:
-    1. Le Clustering (séparer les positions éloignées de > 50m).
-    2. Le Scoring (calculer la confiance basée sur la convergence et la précision).
-    """
-    if not candidates: return []
-    
-    # Conversion Row Spark -> Dictionnaire Python
-    points = [row.asDict() if hasattr(row, 'asDict') else row for row in candidates]
-    clusters = []
-    
-    # --- PHASE A : CLUSTERING GLOUTON (Distance < 50m) ---
-    while points:
-        ref_point = points.pop(0)
-        current_cluster = [ref_point]
-        remaining_points = []
-        
-        for p in points:
-            dist = haversine(ref_point['lat'], ref_point['lon'], p['lat'], p['lon'])
-            if dist <= CLUSTER_THRESHOLD_METERS:
-                current_cluster.append(p)
-            else:
-                remaining_points.append(p)
-        
-        points = remaining_points # On continue avec ceux qui restent
-        
-        # --- PHASE B : CALCUL DU SCORE DU CLUSTER ---
-        n = len(current_cluster)
-        unique_logics = set(p['source_logic'] for p in current_cluster)
-        nb_logics = len(unique_logics)
-        
-        # 1. Calcul du Centroid (Position Moyenne)
-        avg_lat = sum(p['lat'] for p in current_cluster) / n
-        avg_lon = sum(p['lon'] for p in current_cluster) / n
-        
-        # 2. Calcul de la Dispersion (Rayon moyen)
-        spreads = [haversine(avg_lat, avg_lon, p['lat'], p['lon']) for p in current_cluster]
-        avg_spread = sum(spreads) / n if n > 0 else 0
-        
-        # 3. Formule de Scoring (Sur 100)
-        score = 40 # Socle de base
-        
-        # Bonus Convergence : +20 points par logique supplémentaire qui est d'accord
-        score += (nb_logics - 1) * 20
-        
-        # Bonus/Malus Précision
-        if avg_spread <= HIGH_PRECISION_METERS:
-            score += 10 # Bonus précision
-        else:
-            # Pénalité : -0.5 point par mètre d'écart au-delà de 10m
-            score -= (avg_spread - HIGH_PRECISION_METERS) * 0.5
-            
-        final_score = int(max(0, min(100, score)))
-        
-        # Construction de l'objet résultat pour ce cluster
-        clusters.append({
-            "lat": avg_lat,
-            "lon": avg_lon,
-            "score": final_score,
-            "radius_spread": avg_spread,
-            "nb_logics": nb_logics,
-            "logics": list(unique_logics),
-            "sources": current_cluster # On garde les détails pour le debug
-        })
-        
-    # On trie pour que le cluster [0] soit le plus probable (Meilleur Score)
-    clusters.sort(key=lambda x: x['score'], reverse=True)
-    return clusters
+    # GPS linking
+    GPS_WINDOW_SECONDS = 900
+    TEMPORAL_DECAY_HALF_LIFE = 300
 
-# Définition du Schéma de sortie pour Spark (Complexe)
-output_schema = ArrayType(StructType([
+    # CGNAT
+    CGNAT_USER_THRESHOLD = 5
+
+    # Spatial quality
+    MIN_SESSIONS = 3
+    MAX_SPATIAL_IQR_METERS = 200
+
+    # Paths
+    CAMERA_LOGS_PATH = "/data/raw/camera_logs"
+    PHONE_WIFI_PATH = "/data/raw/phone_wifi_logs"
+    PHONE_GPS_PATH = "/data/raw/phone_gps"
+    SILVER_PATH = "/data/silver/camera_locations"
+    GOLD_PATH = "/data/gold/camera_locations"
+
+    # Main logic name — this is the authority
+    MAIN_LOGIC_NAME = "mainLogic"
+
+
+# =============================================================================
+# STANDARD OUTPUT SCHEMA — All logics MUST produce this
+# =============================================================================
+
+LOGIC_OUTPUT_SCHEMA = StructType([
+    StructField("camera_id", StringType(), False),
     StructField("lat", DoubleType(), False),
     StructField("lon", DoubleType(), False),
-    StructField("score", IntegerType(), False),
-    StructField("radius_spread", FloatType(), False),
-    StructField("nb_logics", IntegerType(), False),
-    StructField("logics", ArrayType(StringType()), False),
-    StructField("sources", ArrayType(StructType([
-        StructField("source_logic", StringType()),
-        StructField("lat", DoubleType()),
-        StructField("lon", DoubleType()),
-        StructField("timestamp", StringType()) # Simplifié en string pour l'exemple
-    ])))
-]))
+    StructField("logic_name", StringType(), False),
+    StructField("logic_confidence", DoubleType(), True),   # 0.0 - 1.0, logic's self-assessed confidence
+    StructField("num_evidence_points", IntegerType(), True),
+    StructField("metadata", StringType(), True),            # JSON string for logic-specific info
+])
 
-# Enregistrement UDF
-udf_process_geo = F.udf(process_geolocation_logic, output_schema)
-
-# ==============================================================================
-# 2. GÉNÉRATION DE DONNÉES DE TEST (Simulation)
-# ==============================================================================
-# Ici, on crée des faux DataFrames pour simuler tes tables.
-# Dans la réalité, tu feras : df = spark.read.parquet("...")
-
-# A. HISTORIQUE (Données d'hier)
-history_data = [
-    # Caméra 1 : Hier on pensait qu'elle était à Paris (Wifi)
-    ("cam_01", "WIFI", 48.8566, 2.3522, "2023-10-25 10:00:00"),
-    # Caméra 2 : Hier on avait une install manuelle à Lyon
-    ("cam_02", "INSTALLATION", 45.7640, 4.8357, "2023-01-01 00:00:00"),
-]
-df_history = spark.createDataFrame(history_data, ["camera_id", "source_logic", "lat", "lon", "timestamp"])
-
-# B. DAILY (Données reçues aujourd'hui)
-daily_data = [
-    # Caméra 1 : Le Wifi se met à jour aujourd'hui (légèrement décalé) -> DOIT REMPLACER L'HISTORIQUE
-    ("cam_01", "WIFI", 48.8567, 2.3523, "2023-10-26 14:00:00"),
-    # Caméra 1 : Une nouvelle logique (IP) arrive et confirme Paris -> DOIT S'AJOUTER
-    ("cam_01", "IP_TRACE", 48.8565, 2.3521, "2023-10-26 14:05:00"),
-    
-    # Caméra 2 : Une logique IP arrive mais place la caméra à Marseille (Erreur/Ghost) -> DOIT CRÉER UN CONFLIT
-    ("cam_02", "IP_TRACE", 43.2965, 5.3698, "2023-10-26 09:00:00"),
-]
-df_daily = spark.createDataFrame(daily_data, ["camera_id", "source_logic", "lat", "lon", "timestamp"])
-
-print("--- DONNÉES BRUTES ---")
-# df_history.show()
-# df_daily.show()
-
-# ==============================================================================
-# 3. ÉTAPE DE FUSION (MERGE & DEDUPLICATION)
-# ==============================================================================
-
-# 1. Union de tout le monde
-df_all = df_history.union(df_daily)
-
-# 2. Logique "Champion vs Challenger"
-# Pour chaque (camera, logic), on garde seulement la ligne la plus récente.
-window_spec = Window.partitionBy("camera_id", "source_logic").orderBy(F.col("timestamp").desc())
-
-df_active_logics = df_all.withColumn("rank", F.row_number().over(window_spec)) \
-    .filter(F.col("rank") == 1) \
-    .drop("rank")
-
-# C'est ici que tu sauvegardes ton "Nouvel Historique" pour demain
-# df_active_logics.write.mode("overwrite").parquet("/path/to/history/new")
-
-print("--- DONNÉES APRÈS FUSION (Active Logics) ---")
-df_active_logics.show(truncate=False)
-
-# ==============================================================================
-# 4. ÉTAPE D'AGRÉGATION & SCORING (CLUSTERING)
-# ==============================================================================
-
-# 1. On regroupe toutes les logiques actives dans une liste par caméra
-df_grouped = df_active_logics.groupBy("camera_id").agg(
-    F.collect_list(F.struct("source_logic", "lat", "lon", "timestamp")).alias("candidates_list")
-)
-
-# 2. Application de l'UDF (Clustering + Scoring)
-df_processed = df_grouped.withColumn("geo_clusters", udf_process_geo(F.col("candidates_list")))
-
-# ==============================================================================
-# 5. PRÉPARATION DE LA SORTIE FINALE (ES / UI)
-# ==============================================================================
-
-df_final = df_processed.select(
-    F.col("camera_id"),
-    
-    # --- A. CHAMPS POUR LA TABLE (AG GRID) ---
-    # On prend le cluster à l'index [0] car c'est celui qui a le meilleur score.
-    F.col("geo_clusters")[0]["lat"].alias("grid_lat"),
-    F.col("geo_clusters")[0]["lon"].alias("grid_lon"),
-    F.col("geo_clusters")[0]["score"].alias("grid_confidence"),
-    
-    # Indicateur de conflit : Si on a plus d'un cluster, c'est qu'il y a des positions > 50m
-    (F.size(F.col("geo_clusters")) > 1).alias("has_location_conflict"),
-    
-    # --- B. CHAMPS POUR LA CARTE (MAP / ZOOM) ---
-    # On garde toute la structure complexe. Le Front-end affichera tous les éléments de ce tableau.
-    F.col("geo_clusters").alias("map_locations_details")
-)
-
-print("--- RÉSULTAT FINAL (À ENVOYER DANS ELASTICSEARCH) ---")
-df_final.printSchema()
-df_final.show(truncate=False)
-
-# EXPLICATION DES RÉSULTATS AFFICHÉS :
-# cam_01 : Aura un score élevé (~70) car WIFI et IP sont proches (<50m). Un seul cluster.
-# cam_02 : Aura has_location_conflict=True. Deux clusters dans map_locations_details (Lyon et Marseille).
-import math
-from dataclasses import dataclass
-from pyspark.sql import SparkSession, Window
-from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType
 
 # =============================================================================
-# 1. CONFIGURATION
+# UDF — Haversine
 # =============================================================================
 
-@dataclass
-class Config:
-    # Sessionisation
-    session_gap_minutes: int = 30        # Si trou > 30 min, nouvelle session
-    
-    # GPS Matching & Cleaning
-    gps_time_window_sec: int = 3600      # On cherche des GPS jusqu'à 1h autour
-    max_speed_kmh: int = 250             # Rejet des points "téléportés"
-    gps_accuracy_threshold: int = 100    # Rejet des GPS imprécis (>100m)
-    
-    # Scoring & CGNAT
-    min_gps_points: int = 2              # Minimum de points pour valider une session
-    max_scatter_meters: int = 500        # Si les points sont trop éparpillés -> CGNAT/Bruit -> Rejet
-    cgnat_device_threshold: int = 10     # Si IP a > 10 devices -> Blacklist
-    
-    # Poids pour le score final
-    weight_radius: float = 1.0           # Confiance max
-    weight_ip_only: float = 0.5          # Confiance moyenne
-    decay_halflife_min: float = 10.0     # Le score baisse de moitié si écart de 10 min
+@F.udf(DoubleType())
+def haversine_meters(lat1, lon1, lat2, lon2):
+    if any(v is None for v in [lat1, lon1, lat2, lon2]):
+        return None
+    R = 6_371_000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = (math.sin(dphi / 2) ** 2
+         + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
 
 # =============================================================================
-# 2. OUTILS (Spark Native Optimization)
+# BASE CLASS — All logics extend this
 # =============================================================================
 
-def native_haversine(lat1, lon1, lat2, lon2):
-    """Calcul distance en mètres SANS UDF Python (Performance x100)"""
-    R = 6371000.0
-    rad = F.lit(math.pi / 180.0)
-    dlat = (lat2 - lat1) * rad
-    dlon = (lon2 - lon1) * rad
-    a = F.pow(F.sin(dlat / 2), 2) + \
-        F.cos(lat1 * rad) * F.cos(lat2 * rad) * \
-        F.pow(F.sin(dlon / 2), 2)
-    return R * 2 * F.atan2(F.sqrt(a), F.sqrt(1 - a))
+class BaseLocalizationLogic(ABC):
+    """
+    Abstract base class for a localization logic.
+    Each logic independently attempts to locate cameras.
 
-def temporal_decay_score(diff_seconds, halflife_minutes):
-    """Plus l'écart temporel est grand, plus le score baisse"""
-    halflife_sec = halflife_minutes * 60
-    decay_const = math.log(2) / halflife_sec
-    return F.exp(-decay_const * F.abs(diff_seconds))
+    Subclasses must implement:
+      - name: str property
+      - run(spark, run_date, config) -> DataFrame matching LOGIC_OUTPUT_SCHEMA
+    """
 
-# =============================================================================
-# 3. PIPELINE PRINCIPAL
-# =============================================================================
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Unique name for this logic. 'mainLogic' has special authority."""
+        pass
 
-class CameraInferencePipeline:
-    def __init__(self, spark: SparkSession, conf: Config = None):
-        self.spark = spark
-        self.cfg = conf or Config()
-
-    def run(self, paths: dict):
+    @abstractmethod
+    def run(self, spark: SparkSession, run_date: datetime, config: Config) -> DataFrame:
         """
-        paths = {'camera': '...', 'wifi': '...', 'gps': '...', 'gold': '...'}
+        Execute this logic and return candidate locations.
+
+        Must return a DataFrame with columns:
+          camera_id, lat, lon, logic_name, logic_confidence,
+          num_evidence_points, metadata
         """
-        # --- A. CHARGEMENT & NETTOYAGE GPS ---
-        df_gps = self._load_and_clean_gps(paths['gps'])
-        
-        # --- B. SESSIONIZATION WIFI (Clé de voûte) ---
-        df_sessions = self._build_wifi_sessions(paths['wifi'])
-        
-        # --- C. ANCHORING (Lier Sessions <-> GPS) ---
-        df_anchored = self._anchor_gps_to_sessions(df_sessions, df_gps)
-        
-        # --- D. INFERENCE CAMERA ---
-        df_candidates = self._infer_cameras(paths['camera'], df_anchored)
-        
-        # --- E. GOLD MERGE (Champion vs Challenger) ---
-        self._merge_gold(df_candidates, paths['gold'])
+        pass
 
-    # -------------------------------------------------------------------------
-    # ÉTAPES DÉTAILLÉES
-    # -------------------------------------------------------------------------
+    def validate_output(self, df: DataFrame) -> DataFrame:
+        """Ensure the output conforms to the expected schema."""
+        required_cols = {"camera_id", "lat", "lon", "logic_name"}
+        actual_cols = set(df.columns)
+        missing = required_cols - actual_cols
+        if missing:
+            raise ValueError(f"Logic '{self.name}' output missing columns: {missing}")
+        return df
 
-    def _load_and_clean_gps(self, path):
-        """Nettoyage GPS: Vitesse impossible + Précision"""
-        df = self.spark.read.parquet(path)
-        
-        # 1. Filtre précision de base
-        df = df.filter(F.col("accuracy") <= self.cfg.gps_accuracy_threshold)
-        
-        # 2. Filtre Vitesse (Implémentation 1 logic)
-        w = Window.partitionBy("phone_id").orderBy("timestamp")
-        df = df.withColumn("prev_lat", F.lag("lat").over(w)) \
-               .withColumn("prev_lon", F.lag("lon").over(w)) \
-               .withColumn("prev_ts", F.lag("timestamp").over(w))
-        
-        dist = native_haversine(F.col("lat"), F.col("lon"), F.col("prev_lat"), F.col("prev_lon"))
-        time_diff = F.col("timestamp").cast("long") - F.col("prev_ts").cast("long")
-        speed_kmh = (dist / time_diff) * 3.6
-        
-        return df.filter((speed_kmh < self.cfg.max_speed_kmh) | (speed_kmh.isNull())) \
-                 .select("phone_id", "lat", "lon", "timestamp")
 
-    def _build_wifi_sessions(self, path):
-        """Regroupement des logs WiFi en Sessions [Start, End]"""
-        df = self.spark.read.parquet(path)
-        
-        # Détection changement IP ou trou temporel
-        w = Window.partitionBy("phone_id", "ip", "user_radius").orderBy("timestamp")
-        
-        df = df.withColumn("prev_ts", F.lag("timestamp").over(w))
-        df = df.withColumn("is_new_session", 
+# =============================================================================
+# LOGIC 1: mainLogic — ISP Radius ID Co-location (Highest Authority)
+# =============================================================================
+
+class MainLogic(BaseLocalizationLogic):
+    """
+    The authoritative logic. Matches cameras to phones via User_Radius_ID
+    (same ISP account = same household). Links to GPS with temporal proximity.
+
+    When this logic fires for a camera, its score is 100 and all other
+    logics for that camera are discarded.
+    """
+
+    @property
+    def name(self) -> str:
+        return "mainLogic"
+
+    def run(self, spark, run_date, config):
+        date_str = run_date.strftime("%Y-%m-%d")
+
+        camera_df = spark.read.parquet(config.CAMERA_LOGS_PATH)
+        phone_wifi_df = spark.read.parquet(config.PHONE_WIFI_PATH)
+        phone_gps_df = spark.read.parquet(config.PHONE_GPS_PATH)
+
+        # Camera has Radius ID → match to phone with same Radius ID on same IP
+        cam_day = (
+            camera_df
+            .filter(F.to_date("timestamp") == F.lit(date_str))
+            .filter(F.col("User_Radius_ID").isNotNull())
+        )
+
+        phone_day = phone_wifi_df.filter(F.to_date("timestamp") == F.lit(date_str))
+        gps_day = phone_gps_df.filter(F.to_date("timestamp") == F.lit(date_str))
+
+        # Network match on Radius ID + IP
+        matches = (
+            cam_day.alias("c")
+            .join(
+                phone_day.alias("p"),
+                (F.col("c.User_Radius_ID") == F.col("p.User_Radius_ID"))
+                & (F.col("c.ip") == F.col("p.ip")),
+                "inner"
+            )
+            .select(
+                F.col("c.ip").alias("camera_id"),
+                F.col("p.timestamp").alias("phone_timestamp"),
+                F.col("p.User_Radius_ID").alias("phone_radius_id"),
+            )
+        )
+
+        # Link to GPS within time window
+        matches_ts = matches.withColumn("phone_epoch", F.col("phone_timestamp").cast("long"))
+        gps_ts = gps_day.withColumn("gps_epoch", F.col("timestamp").cast("long"))
+
+        gps_linked = (
+            matches_ts.alias("m")
+            .join(
+                gps_ts.alias("g"),
+                (F.col("m.phone_radius_id") == F.col("g.User_Radius_ID"))
+                & (F.abs(F.col("g.gps_epoch") - F.col("m.phone_epoch")) <= config.GPS_WINDOW_SECONDS),
+                "inner"
+            )
+            .withColumn("time_delta", F.abs(F.col("g.gps_epoch") - F.col("m.phone_epoch")))
+        )
+
+        # Keep closest GPS per match
+        w = Window.partitionBy("camera_id", "phone_timestamp").orderBy("time_delta")
+        best = (
+            gps_linked
+            .withColumn("rn", F.row_number().over(w))
+            .filter(F.col("rn") == 1)
+        )
+
+        # Aggregate per camera — median centroid
+        result = (
+            best
+            .groupBy("camera_id")
+            .agg(
+                F.percentile_approx("g.lat", 0.5).alias("lat"),
+                F.percentile_approx("g.lon", 0.5).alias("lon"),
+                F.count("*").alias("num_evidence_points"),
+                F.avg(
+                    F.exp(-F.log(F.lit(2.0)) * F.col("time_delta") / F.lit(config.TEMPORAL_DECAY_HALF_LIFE))
+                ).alias("logic_confidence"),
+            )
+            .filter(F.col("num_evidence_points") >= config.MIN_SESSIONS)
+            .withColumn("logic_name", F.lit(self.name))
+            .withColumn("logic_confidence", F.least(F.lit(1.0), F.col("logic_confidence")))
+            .withColumn("metadata", F.lit('{"method": "radius_id_colocation"}'))
+            .select("camera_id", "lat", "lon", "logic_name",
+                    "logic_confidence", "num_evidence_points", "metadata")
+        )
+
+        return self.validate_output(result)
+
+
+# =============================================================================
+# LOGIC 2: Residential IP Co-location (Tier 2)
+# =============================================================================
+
+class ResidentialIPLogic(BaseLocalizationLogic):
+    """
+    For cameras WITHOUT a Radius ID: match by IP, but only on IPs
+    classified as residential (not CGNAT).
+    """
+
+    @property
+    def name(self) -> str:
+        return "residentialIPLogic"
+
+    def run(self, spark, run_date, config):
+        date_str = run_date.strftime("%Y-%m-%d")
+
+        camera_df = spark.read.parquet(config.CAMERA_LOGS_PATH)
+        phone_wifi_df = spark.read.parquet(config.PHONE_WIFI_PATH)
+        phone_gps_df = spark.read.parquet(config.PHONE_GPS_PATH)
+
+        # Profile IPs
+        ip_profile = (
+            phone_wifi_df
+            .filter(F.col("User_Radius_ID").isNotNull())
+            .filter(F.to_date("timestamp") == F.lit(date_str))
+            .groupBy("ip")
+            .agg(F.countDistinct("User_Radius_ID").alias("distinct_users"))
+            .filter(F.col("distinct_users") <= config.CGNAT_USER_THRESHOLD)
+            .select("ip")
+        )
+
+        cam_day = (
+            camera_df
+            .filter(F.to_date("timestamp") == F.lit(date_str))
+            .filter(F.col("User_Radius_ID").isNull())
+        )
+
+        phone_day = phone_wifi_df.filter(F.to_date("timestamp") == F.lit(date_str))
+        gps_day = phone_gps_df.filter(F.to_date("timestamp") == F.lit(date_str))
+
+        # IP match on residential IPs only
+        matches = (
+            cam_day.alias("c")
+            .join(ip_profile.alias("ipr"), F.col("c.ip") == F.col("ipr.ip"), "inner")
+            .join(phone_day.alias("p"), F.col("c.ip") == F.col("p.ip"), "inner")
+            .select(
+                F.col("c.ip").alias("camera_id"),
+                F.col("p.timestamp").alias("phone_timestamp"),
+                F.col("p.User_Radius_ID").alias("phone_radius_id"),
+            )
+        )
+
+        # GPS linking (same pattern as mainLogic)
+        matches_ts = matches.withColumn("phone_epoch", F.col("phone_timestamp").cast("long"))
+        gps_ts = gps_day.withColumn("gps_epoch", F.col("timestamp").cast("long"))
+
+        gps_linked = (
+            matches_ts.alias("m")
+            .join(
+                gps_ts.alias("g"),
+                (F.col("m.phone_radius_id") == F.col("g.User_Radius_ID"))
+                & (F.abs(F.col("g.gps_epoch") - F.col("m.phone_epoch")) <= config.GPS_WINDOW_SECONDS),
+                "inner"
+            )
+            .withColumn("time_delta", F.abs(F.col("g.gps_epoch") - F.col("m.phone_epoch")))
+        )
+
+        w = Window.partitionBy("camera_id", "phone_timestamp").orderBy("time_delta")
+        best = gps_linked.withColumn("rn", F.row_number().over(w)).filter(F.col("rn") == 1)
+
+        result = (
+            best
+            .groupBy("camera_id")
+            .agg(
+                F.percentile_approx("g.lat", 0.5).alias("lat"),
+                F.percentile_approx("g.lon", 0.5).alias("lon"),
+                F.count("*").alias("num_evidence_points"),
+                F.avg(
+                    F.exp(-F.log(F.lit(2.0)) * F.col("time_delta") / F.lit(config.TEMPORAL_DECAY_HALF_LIFE))
+                ).alias("logic_confidence"),
+            )
+            .filter(F.col("num_evidence_points") >= config.MIN_SESSIONS)
+            .withColumn("logic_name", F.lit(self.name))
+            .withColumn("logic_confidence",
+                        F.least(F.lit(1.0), F.col("logic_confidence") * 0.7))  # penalize vs mainLogic
+            .withColumn("metadata", F.lit('{"method": "residential_ip_colocation"}'))
+            .select("camera_id", "lat", "lon", "logic_name",
+                    "logic_confidence", "num_evidence_points", "metadata")
+        )
+
+        return self.validate_output(result)
+
+
+# =============================================================================
+# LOGIC 3: Recurring Co-location Pattern (Multi-day)
+# =============================================================================
+
+class RecurringColocationLogic(BaseLocalizationLogic):
+    """
+    Looks at the past 7 days of IP co-location data (any tier).
+    If a camera repeatedly appears on the same network as phones that
+    cluster around the same GPS point across multiple days, that's a
+    strong signal even if each individual day is weak.
+    """
+
+    @property
+    def name(self) -> str:
+        return "recurringColocationLogic"
+
+    def run(self, spark, run_date, config):
+        from datetime import timedelta
+
+        camera_df = spark.read.parquet(config.CAMERA_LOGS_PATH)
+        phone_wifi_df = spark.read.parquet(config.PHONE_WIFI_PATH)
+        phone_gps_df = spark.read.parquet(config.PHONE_GPS_PATH)
+
+        start_date = (run_date - timedelta(days=7)).strftime("%Y-%m-%d")
+        end_date = run_date.strftime("%Y-%m-%d")
+
+        # 7-day window
+        cam_window = camera_df.filter(
+            (F.to_date("timestamp") >= F.lit(start_date))
+            & (F.to_date("timestamp") <= F.lit(end_date))
+        )
+        phone_window = phone_wifi_df.filter(
+            (F.to_date("timestamp") >= F.lit(start_date))
+            & (F.to_date("timestamp") <= F.lit(end_date))
+        )
+        gps_window = phone_gps_df.filter(
+            (F.to_date("timestamp") >= F.lit(start_date))
+            & (F.to_date("timestamp") <= F.lit(end_date))
+        )
+
+        # Match on IP (both with and without Radius ID)
+        matches = (
+            cam_window.alias("c")
+            .join(phone_window.alias("p"), F.col("c.ip") == F.col("p.ip"), "inner")
+            .filter(F.col("p.User_Radius_ID").isNotNull())
+            .select(
+                F.col("c.ip").alias("camera_id"),
+                F.col("p.timestamp").alias("phone_timestamp"),
+                F.col("p.User_Radius_ID").alias("phone_radius_id"),
+                F.to_date("c.timestamp").alias("match_date"),
+            )
+        )
+
+        # GPS link
+        matches_ts = matches.withColumn("phone_epoch", F.col("phone_timestamp").cast("long"))
+        gps_ts = gps_window.withColumn("gps_epoch", F.col("timestamp").cast("long"))
+
+        gps_linked = (
+            matches_ts.alias("m")
+            .join(
+                gps_ts.alias("g"),
+                (F.col("m.phone_radius_id") == F.col("g.User_Radius_ID"))
+                & (F.abs(F.col("g.gps_epoch") - F.col("m.phone_epoch")) <= config.GPS_WINDOW_SECONDS),
+                "inner"
+            )
+            .withColumn("time_delta", F.abs(F.col("g.gps_epoch") - F.col("m.phone_epoch")))
+        )
+
+        w = Window.partitionBy("camera_id", "phone_timestamp").orderBy("time_delta")
+        best = gps_linked.withColumn("rn", F.row_number().over(w)).filter(F.col("rn") == 1)
+
+        # Require data from at least 3 distinct days
+        result = (
+            best
+            .groupBy("camera_id")
+            .agg(
+                F.percentile_approx("g.lat", 0.5).alias("lat"),
+                F.percentile_approx("g.lon", 0.5).alias("lon"),
+                F.count("*").alias("num_evidence_points"),
+                F.countDistinct("match_date").alias("distinct_days"),
+                F.avg(
+                    F.exp(-F.log(F.lit(2.0)) * F.col("time_delta") / F.lit(config.TEMPORAL_DECAY_HALF_LIFE))
+                ).alias("logic_confidence"),
+            )
+            .filter(F.col("distinct_days") >= 3)
+            .withColumn("logic_name", F.lit(self.name))
+            .withColumn("logic_confidence",
+                        F.least(F.lit(1.0), F.col("logic_confidence") * 0.8))
+            .withColumn("metadata",
+                        F.concat(F.lit('{"method":"recurring_7day","distinct_days":'),
+                                 F.col("distinct_days").cast(StringType()),
+                                 F.lit('}')))
+            .select("camera_id", "lat", "lon", "logic_name",
+                    "logic_confidence", "num_evidence_points", "metadata")
+        )
+
+        return self.validate_output(result)
+
+
+# =============================================================================
+# LOGIC 4: Stub — Add your own logic here
+# =============================================================================
+
+class ExampleCustomLogic(BaseLocalizationLogic):
+    """
+    TEMPLATE: Copy this class to add a new localization logic.
+    Examples of what you could implement:
+      - Reverse DNS / hostname-based geolocation
+      - IP geolocation database lookup (MaxMind, etc.)
+      - Camera MAC OUI + known deployment databases
+      - Network topology inference from traceroute-like data
+    """
+
+    @property
+    def name(self) -> str:
+        return "customLogicExample"
+
+    def run(self, spark, run_date, config):
+        # Return an empty DataFrame with the correct schema
+        return spark.createDataFrame([], LOGIC_OUTPUT_SCHEMA)
+
+
+# =============================================================================
+# LOGIC REGISTRY — Add new logics here
+# =============================================================================
+
+LOGIC_REGISTRY = [
+    MainLogic(),
+    ResidentialIPLogic(),
+    RecurringColocationLogic(),
+    # ExampleCustomLogic(),       # <-- uncomment or add yours here
+]
+
+
+# =============================================================================
+# CONVERGENCE ENGINE
+# =============================================================================
+
+class ConvergenceEngine:
+    """
+    Takes outputs from all logics and MERGES converging logics into a single row.
+
+    Output: one row per DISTINCT LOCATION per camera (not per logic).
+      - Converging logics → fused into 1 row (weighted centroid)
+      - Non-converging logics → 1 row each
+      - mainLogic → 1 row, score=100
+
+    Each row carries bidirectional cross-references:
+      - alternative_locations: names of logics proposing a different location
+      - best_location_logics:  names of logics forming the best location
+
+    Rules:
+      - mainLogic → score=100, is_best=True. Others kept as alternative rows.
+      - No mainLogic → converging logics fused into one primary row.
+        Non-converging logics = separate alternative rows.
+      - Single logic → isolated row, low confidence.
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+
+    def score_and_merge(self, all_candidates: DataFrame, spark: SparkSession) -> DataFrame:
+        config = self.config
+
+        # =================================================================
+        # PHASE 1: Assign unique row_id
+        # =================================================================
+        candidates = all_candidates.withColumn(
+            "row_id", F.monotonically_increasing_id()
+        )
+
+        # =================================================================
+        # PHASE 2: Pairwise distances (ALL logics, ALL cameras)
+        # =================================================================
+        left = candidates.alias("a")
+        right = candidates.alias("b")
+
+        pairs = (
+            left.join(
+                right,
+                (F.col("a.camera_id") == F.col("b.camera_id"))
+                & (F.col("a.row_id") < F.col("b.row_id")),
+                "inner"
+            )
+            .withColumn(
+                "distance_m",
+                haversine_meters(
+                    F.col("a.lat"), F.col("a.lon"),
+                    F.col("b.lat"), F.col("b.lon")
+                )
+            )
+            .withColumn(
+                "within_radius",
+                F.col("distance_m") <= config.CONVERGENCE_RADIUS_METERS
+            )
+            .select(
+                F.col("a.camera_id").alias("camera_id"),
+                F.col("a.logic_name").alias("logic_a"),
+                F.col("b.logic_name").alias("logic_b"),
+                "distance_m",
+                "within_radius",
+            )
+        )
+
+        # =================================================================
+        # PHASE 3: Build convergence sets per logic
+        # =================================================================
+        conv_from_a = (
+            pairs.filter(F.col("within_radius"))
+            .select("camera_id",
+                    F.col("logic_a").alias("logic_name"),
+                    F.col("logic_b").alias("converges_with_logic"))
+        )
+        conv_from_b = (
+            pairs.filter(F.col("within_radius"))
+            .select("camera_id",
+                    F.col("logic_b").alias("logic_name"),
+                    F.col("logic_a").alias("converges_with_logic"))
+        )
+        all_convergences = conv_from_a.unionByName(conv_from_b)
+
+        conv_agg = (
+            all_convergences
+            .groupBy("camera_id", "logic_name")
+            .agg(
+                F.collect_set("converges_with_logic").alias("converges_with"),
+                F.count("*").alias("num_converging"),
+            )
+        )
+
+        # =================================================================
+        # PHASE 4: Enrich candidates
+        # =================================================================
+        enriched = (
+            candidates
+            .join(conv_agg, ["camera_id", "logic_name"], "left")
+            .withColumn("converges_with",
+                        F.coalesce(F.col("converges_with"), F.array()))
+            .withColumn("num_converging",
+                        F.coalesce(F.col("num_converging"), F.lit(0)))
+        )
+
+        # Count logics per camera
+        logic_count = (
+            candidates.groupBy("camera_id")
+            .agg(F.count("*").alias("total_logics_for_camera"))
+        )
+        enriched = enriched.join(logic_count, "camera_id", "left")
+
+        # Has mainLogic?
+        has_main = (
+            candidates
+            .filter(F.col("logic_name") == config.MAIN_LOGIC_NAME)
+            .select("camera_id").distinct()
+            .withColumn("has_main_logic", F.lit(True))
+        )
+        enriched = (
+            enriched.join(has_main, "camera_id", "left")
+            .withColumn("has_main_logic",
+                        F.coalesce(F.col("has_main_logic"), F.lit(False)))
+        )
+
+        # =================================================================
+        # PHASE 5: Find primary cluster per camera (without mainLogic)
+        # =================================================================
+        # Anchor = logic with the most convergences
+        best_conv = (
+            enriched.filter(~F.col("has_main_logic"))
+            .groupBy("camera_id")
+            .agg(F.max("num_converging").alias("max_converging"))
+        )
+
+        primary_anchor = (
+            enriched.filter(~F.col("has_main_logic"))
+            .join(best_conv, "camera_id", "inner")
+            .filter(
+                (F.col("num_converging") == F.col("max_converging"))
+                & (F.col("num_converging") > 0)
+            )
+            .groupBy("camera_id")
+            .agg(
+                F.array_distinct(
+                    F.flatten(F.array(
+                        F.collect_set("logic_name"),
+                        F.flatten(F.collect_list("converges_with"))
+                    ))
+                ).alias("primary_logics")
+            )
+        )
+
+        enriched = enriched.join(primary_anchor, "camera_id", "left")
+
+        # Tag each logic as primary / alternative / isolated
+        enriched = enriched.withColumn(
+            "role",
             F.when(
-                (F.col("timestamp").cast("long") - F.col("prev_ts").cast("long")) > (self.cfg.session_gap_minutes * 60), 
-                1
-            ).otherwise(0)
-        )
-        
-        # ID unique de session
-        df = df.withColumn("session_id", F.sum("is_new_session").over(w))
-        
-        # Aggregation
-        return df.groupBy("phone_id", "ip", "user_radius", "session_id") \
-                 .agg(
-                     F.min("timestamp").alias("s_start"),
-                     F.max("timestamp").alias("s_end")
-                 )
-
-    def _anchor_gps_to_sessions(self, df_sessions, df_gps):
-        """Attache le meilleur GPS à chaque session WiFi"""
-        
-        # 1. Jointure Range (Optimisée)
-        # On ne garde que les GPS dans la fenêtre temporelle de la session (+/- buffer)
-        cond = (df_sessions.phone_id == df_gps.phone_id) & \
-               (df_gps.timestamp >= df_sessions.s_start - self.cfg.gps_time_window_sec) & \
-               (df_gps.timestamp <= df_sessions.s_end + self.cfg.gps_time_window_sec)
-        
-        joined = df_sessions.join(df_gps, cond, "inner")
-        
-        # 2. Calcul des métriques de la session (Scatter & Decay)
-        # On calcule l'écart temporel moyen pour cette session
-        mid_session = (F.col("s_start").cast("long") + F.col("s_end").cast("long")) / 2
-        joined = joined.withColumn("time_gap", F.abs(F.col("timestamp").cast("long") - mid_session))
-        
-        # 3. Aggregation par session (Utilisation de la MEDIANE pour robustesse)
-        # On calcule le centroïde (médiane lat/lon) et la dispersion (stddev)
-        session_locs = joined.groupBy("ip", "user_radius").agg(
-            F.expr("percentile_approx(lat, 0.5)").alias("net_lat"),
-            F.expr("percentile_approx(lon, 0.5)").alias("net_lon"),
-            F.stddev("lat").alias("lat_std"), # Proxy simple pour le scatter
-            F.min("time_gap").alias("min_time_gap"),
-            F.count("*").alias("gps_count"),
-            F.countDistinct("phone_id").alias("device_count")
-        )
-        
-        # 4. Filtrage Qualité (CGNAT & Noise Filter)
-        # Si trop de devices sur l'IP -> Blacklist
-        # Si trop de dispersion géographique -> Mauvaise qualité
-        # Si pas assez de points GPS -> Pas fiable
-        valid_networks = session_locs.filter(
-            (F.col("device_count") < self.cfg.cgnat_device_threshold) & 
-            (F.col("lat_std") < 0.005) & # ~500m approx en degrés
-            (F.col("gps_count") >= self.cfg.min_gps_points)
-        )
-        
-        # Calcul du score final du réseau
-        return valid_networks.withColumn(
-            "net_score", 
-            temporal_decay_score(F.col("min_time_gap"), self.cfg.decay_halflife_min)
+                F.col("has_main_logic") & (F.col("logic_name") == config.MAIN_LOGIC_NAME),
+                F.lit("main")
+            ).when(
+                F.col("has_main_logic") & (F.col("logic_name") != config.MAIN_LOGIC_NAME),
+                F.lit("alternative")
+            ).when(
+                F.col("primary_logics").isNotNull()
+                & F.array_contains(F.col("primary_logics"), F.col("logic_name")),
+                F.lit("primary_member")
+            ).when(
+                F.col("primary_logics").isNotNull(),
+                F.lit("alternative")
+            ).otherwise(
+                F.lit("isolated")
+            )
         )
 
-    def _infer_cameras(self, path_cam, df_networks):
-        """Propagation aux caméras"""
-        df_cam = self.spark.read.parquet(path_cam)
-        
-        # BRANCHE A: RADIUS (Prioritaire)
-        safe_nets = df_networks.filter(F.col("user_radius").isNotNull())
-        matches_safe = df_cam.filter(F.col("user_radius").isNotNull()) \
-                             .join(safe_nets, ["ip", "user_radius"], "inner") \
-                             .withColumn("final_score", F.col("net_score") * self.cfg.weight_radius) \
-                             .withColumn("method", F.lit("radius"))
+        # =================================================================
+        # PHASE 6: Build output rows
+        # =================================================================
 
-        # BRANCHE B: IP ONLY (Dégradée)
-        # On prend les réseaux qui n'ont PAS de user_radius connu côté réseau
-        risky_nets = df_networks.drop("user_radius")
-        matches_risky = df_cam.filter(F.col("user_radius").isNull()) \
-                              .join(risky_nets, "ip", "inner") \
-                              .withColumn("final_score", F.col("net_score") * self.cfg.weight_ip_only) \
-                              .withColumn("method", F.lit("ip_only"))
-        
-        return matches_safe.unionByName(matches_risky)
+        # ── A) mainLogic rows (1 row per camera that has mainLogic) ─────
+        main_rows = (
+            enriched.filter(F.col("role") == "main")
+            .select(
+                "camera_id",
+                "lat",
+                "lon",
+                F.col("logic_name").alias("contributing_logics"),
+                "logic_confidence",
+                "num_evidence_points",
+                F.lit(config.MAIN_LOGIC_SCORE).alias("final_score"),
+                F.lit(True).alias("is_best_location"),
+                F.lit("primary").alias("convergence_group"),
+                F.lit(1).alias("num_contributing_logics"),
+                "total_logics_for_camera",
+                F.lit("high").alias("confidence_flag"),
+                "metadata",
+            )
+        )
 
-    def _merge_gold(self, df_candidates, path_gold):
-        """Strategie Best-Record-Wins"""
+        # ── B) Primary cluster → FUSED into 1 row (weighted centroid) ──
+        primary_members = enriched.filter(F.col("role") == "primary_member")
+
+        fused_primary = (
+            primary_members
+            .groupBy("camera_id", "total_logics_for_camera")
+            .agg(
+                # Weighted centroid
+                (F.sum(F.col("lat") * F.col("logic_confidence"))
+                 / F.sum("logic_confidence")).alias("lat"),
+                (F.sum(F.col("lon") * F.col("logic_confidence"))
+                 / F.sum("logic_confidence")).alias("lon"),
+                # Fuse logic names
+                F.concat_ws(",", F.sort_array(F.collect_set("logic_name")))
+                    .alias("contributing_logics"),
+                # Aggregate confidence & evidence
+                F.max("logic_confidence").alias("logic_confidence"),
+                F.sum("num_evidence_points").alias("num_evidence_points"),
+                F.count("*").alias("num_contributing_logics"),
+                F.max("num_converging").alias("max_converging"),
+                # Collect all metadata as JSON array
+                F.concat_ws(" | ", F.collect_list("metadata")).alias("metadata"),
+            )
+            .withColumn(
+                "final_score",
+                F.least(
+                    F.lit(config.MAX_SCORE_WITHOUT_MAIN),
+                    F.lit(config.BASE_SCORE_SINGLE_LOGIC)
+                    + F.lit(config.CONVERGENCE_BONUS_PER_LOGIC)
+                      * (F.col("num_contributing_logics") - 1)
+                )
+            )
+            .withColumn("is_best_location", F.lit(True))
+            .withColumn("convergence_group", F.lit("primary"))
+            .withColumn(
+                "confidence_flag",
+                F.when(F.col("num_contributing_logics") >= 3, F.lit("high"))
+                 .when(F.col("num_contributing_logics") == 2, F.lit("medium"))
+                 .otherwise(F.lit("low_confidence"))
+            )
+            .select(
+                "camera_id", "lat", "lon", "contributing_logics",
+                "logic_confidence", "num_evidence_points", "final_score",
+                "is_best_location", "convergence_group",
+                "num_contributing_logics", "total_logics_for_camera",
+                "confidence_flag", "metadata",
+            )
+        )
+
+        # ── C) Alternative rows (1 row each, kept as-is) ───────────────
+        alternative_rows = (
+            enriched.filter(F.col("role") == "alternative")
+            .select(
+                "camera_id",
+                "lat",
+                "lon",
+                F.col("logic_name").alias("contributing_logics"),
+                "logic_confidence",
+                "num_evidence_points",
+                F.lit(config.BASE_SCORE_SINGLE_LOGIC).alias("final_score"),
+                F.lit(False).alias("is_best_location"),
+                F.lit("alternative").alias("convergence_group"),
+                F.lit(1).alias("num_contributing_logics"),
+                "total_logics_for_camera",
+                F.lit("low_confidence").alias("confidence_flag"),
+                "metadata",
+            )
+        )
+
+        # ── D) Isolated rows (single logic, no comparison) ─────────────
+        isolated_rows = (
+            enriched.filter(F.col("role") == "isolated")
+            .select(
+                "camera_id",
+                "lat",
+                "lon",
+                F.col("logic_name").alias("contributing_logics"),
+                "logic_confidence",
+                "num_evidence_points",
+                F.lit(config.BASE_SCORE_SINGLE_LOGIC).alias("final_score"),
+                F.lit(True).alias("is_best_location"),
+                F.lit("isolated").alias("convergence_group"),
+                F.lit(1).alias("num_contributing_logics"),
+                "total_logics_for_camera",
+                F.lit("low_confidence").alias("confidence_flag"),
+                "metadata",
+            )
+        )
+
+        # =================================================================
+        # PHASE 7: Union all rows
+        # =================================================================
+        all_rows = (
+            main_rows
+            .unionByName(fused_primary)
+            .unionByName(alternative_rows)
+            .unionByName(isolated_rows)
+        )
+
+        # =================================================================
+        # PHASE 8: Cross-references (bidirectional)
+        # =================================================================
+
+        # Primary/main logics per camera
+        best_per_camera = (
+            all_rows
+            .filter(F.col("convergence_group") == "primary")
+            .groupBy("camera_id")
+            .agg(F.concat_ws(",", F.collect_set("contributing_logics"))
+                  .alias("_best_logics"))
+        )
+
+        # Alternative logics per camera
+        alt_per_camera = (
+            all_rows
+            .filter(F.col("convergence_group").isin("alternative", "isolated"))
+            .groupBy("camera_id")
+            .agg(F.concat_ws(",", F.collect_set("contributing_logics"))
+                  .alias("_alt_logics"))
+        )
+
+        all_rows = (
+            all_rows
+            .join(best_per_camera, "camera_id", "left")
+            .join(alt_per_camera, "camera_id", "left")
+        )
+
+        # Assign cross-refs based on group
+        all_rows = (
+            all_rows
+            .withColumn(
+                "alternative_locations",
+                F.when(F.col("convergence_group") == "primary",
+                       F.coalesce(F.col("_alt_logics"), F.lit("")))
+                 .otherwise(F.lit(""))
+            )
+            .withColumn(
+                "best_location_logics",
+                F.when(F.col("convergence_group").isin("alternative", "isolated"),
+                       F.coalesce(F.col("_best_logics"), F.lit("")))
+                 .otherwise(F.lit(""))
+            )
+        )
+
+        # Fix is_best_location: only 1 True per camera
+        best_w = Window.partitionBy("camera_id").orderBy(
+            F.desc("final_score"), F.desc("logic_confidence"),
+            F.desc("num_evidence_points")
+        )
+        all_rows = (
+            all_rows
+            .withColumn("_rank", F.row_number().over(best_w))
+            .withColumn("is_best_location", F.col("_rank") == 1)
+        )
+
+        # =================================================================
+        # PHASE 9: Clean select
+        # =================================================================
+        final = all_rows.select(
+            "camera_id",
+            "lat",
+            "lon",
+            "contributing_logics",
+            "logic_confidence",
+            "num_evidence_points",
+            "final_score",
+            "is_best_location",
+            "convergence_group",
+            "alternative_locations",
+            "best_location_logics",
+            "num_contributing_logics",
+            "total_logics_for_camera",
+            "confidence_flag",
+            "metadata",
+        )
+
+        return final
+
+
+# =============================================================================
+# GOLD TABLE MERGE
+# =============================================================================
+
+def merge_to_gold(silver_df, spark, config=Config):
+    """
+    Gold table keeps ALL rows (every logic for every camera).
+    Merge strategy: for each camera, compare the BEST score in silver
+    vs the BEST score in gold. If silver is better (or camera is new),
+    replace ALL rows for that camera with silver's rows.
+    Otherwise keep gold's rows.
+
+    This ensures the gold table always has the complete picture
+    (all logics + cross-references) from the best-scoring run.
+    """
+    try:
+        gold_df = spark.read.parquet(config.GOLD_PATH)
+    except Exception:
+        silver_df.write.mode("overwrite").parquet(config.GOLD_PATH)
+        print("[GOLD] Initialized Gold table from Silver.")
+        return silver_df
+
+    # Best score per camera in each table
+    gold_best = (
+        gold_df
+        .groupBy("camera_id")
+        .agg(F.max("final_score").alias("gold_best_score"))
+    )
+    silver_best = (
+        silver_df
+        .groupBy("camera_id")
+        .agg(F.max("final_score").alias("silver_best_score"))
+    )
+
+    # Decide per camera: take silver or keep gold?
+    comparison = (
+        gold_best.alias("g")
+        .join(silver_best.alias("s"), "camera_id", "full_outer")
+        .withColumn(
+            "winner",
+            F.when(F.col("gold_best_score").isNull(), F.lit("silver"))  # new camera
+             .when(F.col("silver_best_score").isNull(), F.lit("gold"))  # no new data
+             .when(F.col("silver_best_score") > F.col("gold_best_score"), F.lit("silver"))
+             .otherwise(F.lit("gold"))
+        )
+        .select("camera_id", "winner")
+    )
+
+    # Cameras where silver wins → take all silver rows
+    silver_winners = comparison.filter(F.col("winner") == "silver").select("camera_id")
+    silver_rows = silver_df.join(silver_winners, "camera_id", "inner")
+
+    # Cameras where gold wins → keep all gold rows
+    gold_winners = comparison.filter(F.col("winner") == "gold").select("camera_id")
+    gold_rows = gold_df.join(gold_winners, "camera_id", "inner")
+
+    # Union
+    final = gold_rows.unionByName(silver_rows, allowMissingColumns=True)
+
+    final.write.mode("overwrite").parquet(config.GOLD_PATH)
+    distinct_cameras = final.select("camera_id").distinct().count()
+    total_rows = final.count()
+    print(f"[GOLD] Merged. {distinct_cameras} cameras, {total_rows} total rows.")
+
+    return final
+
+
+# =============================================================================
+# MAIN PIPELINE
+# =============================================================================
+
+def run_pipeline(run_date, config=Config):
+    spark = (
+        SparkSession.builder
+        .appName(f"MultiLogicGeolocation_{run_date.strftime('%Y%m%d')}")
+        .config("spark.sql.adaptive.enabled", "true")
+        .getOrCreate()
+    )
+
+    print(f"\n{'='*70}")
+    print(f"  Multi-Logic Camera Geolocation — {run_date.strftime('%Y-%m-%d')}")
+    print(f"  Registered logics: {[l.name for l in LOGIC_REGISTRY]}")
+    print(f"{'='*70}\n")
+
+    # ── Run all logics ──────────────────────────────────────────────────
+    all_results = []
+    for logic in LOGIC_REGISTRY:
+        print(f"  [RUNNING] {logic.name}...")
         try:
-            df_history = self.spark.read.parquet(path_gold)
-        except:
-            df_history = self.spark.createDataFrame([], df_candidates.schema)
+            result = logic.run(spark, run_date, config)
+            count = result.count()
+            print(f"  [DONE]    {logic.name} → {count} cameras located")
+            if count > 0:
+                all_results.append(result)
+        except Exception as e:
+            print(f"  [ERROR]   {logic.name} failed: {e}")
 
-        # On combine tout
-        df_all = df_history.unionByName(df_candidates, allowMissingColumns=True)
-        
-        # TRI INTELLIGENT
-        # 1. Méthode (Radius > IP)
-        # 2. Score (Proximité temporelle)
-        # 3. Récence (Si égalité, le plus récent gagne)
-        w = Window.partitionBy("camera_id").orderBy(
-            F.when(F.col("method") == "radius", 2).otherwise(1).desc(),
-            F.col("final_score").desc(),
-            F.col("timestamp").desc()
-        )
-        
-        df_final = df_all.withColumn("rank", F.row_number().over(w)) \
-                         .filter(F.col("rank") == 1) \
-                         .drop("rank")
-        
-        # Sauvegarde
-        df_final.write.mode("overwrite").parquet(path_gold)
-        print("Gold Updated.")
+    if not all_results:
+        print("\n  No logics produced results. Exiting.")
+        spark.stop()
+        return
 
-# =============================================================================
-# EXECUTION
-# =============================================================================
+    # Union all logic outputs
+    all_candidates = all_results[0]
+    for df in all_results[1:]:
+        all_candidates = all_candidates.unionByName(df, allowMissingColumns=True)
+
+    print(f"\n  Total candidates across all logics: {all_candidates.count()}")
+
+    # ── Convergence scoring ─────────────────────────────────────────────
+    print("\n  [CONVERGENCE] Scoring...")
+    engine = ConvergenceEngine(config)
+    silver = engine.score_and_merge(all_candidates, spark)
+    silver = silver.withColumn("run_date", F.lit(run_date.strftime("%Y-%m-%d")).cast(DateType()))
+
+    # Print summary
+    print("\n  ── Results Summary ──")
+    distinct_cameras = silver.select("camera_id").distinct().count()
+    total_rows = silver.count()
+    print(f"  Cameras: {distinct_cameras}, Total rows: {total_rows}")
+
+    print("\n  By convergence group:")
+    silver.groupBy("convergence_group").agg(
+        F.count("*").alias("rows"),
+        F.countDistinct("camera_id").alias("cameras"),
+        F.round(F.avg("final_score"), 1).alias("avg_score"),
+    ).show()
+
+    # Show cameras that have alternative locations
+    cameras_with_alternatives = (
+        silver
+        .filter(F.col("alternative_locations") != "")
+        .select("camera_id")
+        .distinct()
+        .count()
+    )
+    print(f"  Cameras with alternative locations flagged: {cameras_with_alternatives}")
+
+    # ── Write Silver ────────────────────────────────────────────────────
+    silver.write.mode("overwrite").parquet(
+        f"{config.SILVER_PATH}/run_date={run_date.strftime('%Y-%m-%d')}"
+    )
+
+    # ── Merge to Gold ───────────────────────────────────────────────────
+    print("  [GOLD] Merging...")
+    merge_to_gold(silver, spark, config)
+
+    print(f"\n{'='*70}")
+    print(f"  Pipeline complete.")
+    print(f"{'='*70}\n")
+    spark.stop()
+
 
 if __name__ == "__main__":
-    spark = SparkSession.builder.appName("CameraGeolocFinal").getOrCreate()
-    
-    pipeline = CameraInferencePipeline(spark)
-    
-    paths = {
-        "camera": "hdfs://.../raw/camera/",
-        "wifi":   "hdfs://.../raw/phone_wifi/",
-        "gps":    "hdfs://.../raw/phone_gps/",
-        "gold":   "hdfs://.../gold/camera_master/"
-    }
-    
-    pipeline.run(paths)
-import math
-from dataclasses import dataclass
-from pyspark.sql import SparkSession, Window
-from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType
-
-# =============================================================================
-# 1. CONFIGURATION
-# =============================================================================
-
-@dataclass
-class Config:
-    # Sessionisation
-    session_gap_minutes: int = 30        # Si trou > 30 min, nouvelle session
-    
-    # GPS Matching & Cleaning
-    gps_time_window_sec: int = 3600      # On cherche des GPS jusqu'à 1h autour
-    max_speed_kmh: int = 250             # Rejet des points "téléportés"
-    gps_accuracy_threshold: int = 100    # Rejet des GPS imprécis (>100m)
-    
-    # Scoring & CGNAT
-    min_gps_points: int = 2              # Minimum de points pour valider une session
-    max_scatter_meters: int = 500        # Si les points sont trop éparpillés -> CGNAT/Bruit -> Rejet
-    cgnat_device_threshold: int = 10     # Si IP a > 10 devices -> Blacklist
-    
-    # Poids pour le score final
-    weight_radius: float = 1.0           # Confiance max
-    weight_ip_only: float = 0.5          # Confiance moyenne
-    decay_halflife_min: float = 10.0     # Le score baisse de moitié si écart de 10 min
-
-# =============================================================================
-# 2. OUTILS (Spark Native Optimization)
-# =============================================================================
-
-def native_haversine(lat1, lon1, lat2, lon2):
-    """Calcul distance en mètres SANS UDF Python (Performance x100)"""
-    R = 6371000.0
-    rad = F.lit(math.pi / 180.0)
-    dlat = (lat2 - lat1) * rad
-    dlon = (lon2 - lon1) * rad
-    a = F.pow(F.sin(dlat / 2), 2) + \
-        F.cos(lat1 * rad) * F.cos(lat2 * rad) * \
-        F.pow(F.sin(dlon / 2), 2)
-    return R * 2 * F.atan2(F.sqrt(a), F.sqrt(1 - a))
-
-def temporal_decay_score(diff_seconds, halflife_minutes):
-    """Plus l'écart temporel est grand, plus le score baisse"""
-    halflife_sec = halflife_minutes * 60
-    decay_const = math.log(2) / halflife_sec
-    return F.exp(-decay_const * F.abs(diff_seconds))
-
-# =============================================================================
-# 3. PIPELINE PRINCIPAL
-# =============================================================================
-
-class CameraInferencePipeline:
-    def __init__(self, spark: SparkSession, conf: Config = None):
-        self.spark = spark
-        self.cfg = conf or Config()
-
-    def run(self, paths: dict):
-        """
-        paths = {'camera': '...', 'wifi': '...', 'gps': '...', 'gold': '...'}
-        """
-        # --- A. CHARGEMENT & NETTOYAGE GPS ---
-        df_gps = self._load_and_clean_gps(paths['gps'])
-        
-        # --- B. SESSIONIZATION WIFI (Clé de voûte) ---
-        df_sessions = self._build_wifi_sessions(paths['wifi'])
-        
-        # --- C. ANCHORING (Lier Sessions <-> GPS) ---
-        df_anchored = self._anchor_gps_to_sessions(df_sessions, df_gps)
-        
-        # --- D. INFERENCE CAMERA ---
-        df_candidates = self._infer_cameras(paths['camera'], df_anchored)
-        
-        # --- E. GOLD MERGE (Champion vs Challenger) ---
-        self._merge_gold(df_candidates, paths['gold'])
-
-    # -------------------------------------------------------------------------
-    # ÉTAPES DÉTAILLÉES
-    # -------------------------------------------------------------------------
-
-    def _load_and_clean_gps(self, path):
-        """Nettoyage GPS: Vitesse impossible + Précision"""
-        df = self.spark.read.parquet(path)
-        
-        # 1. Filtre précision de base
-        df = df.filter(F.col("accuracy") <= self.cfg.gps_accuracy_threshold)
-        
-        # 2. Filtre Vitesse (Implémentation 1 logic)
-        w = Window.partitionBy("phone_id").orderBy("timestamp")
-        df = df.withColumn("prev_lat", F.lag("lat").over(w)) \
-               .withColumn("prev_lon", F.lag("lon").over(w)) \
-               .withColumn("prev_ts", F.lag("timestamp").over(w))
-        
-        dist = native_haversine(F.col("lat"), F.col("lon"), F.col("prev_lat"), F.col("prev_lon"))
-        time_diff = F.col("timestamp").cast("long") - F.col("prev_ts").cast("long")
-        speed_kmh = (dist / time_diff) * 3.6
-        
-        return df.filter((speed_kmh < self.cfg.max_speed_kmh) | (speed_kmh.isNull())) \
-                 .select("phone_id", "lat", "lon", "timestamp")
-
-    def _build_wifi_sessions(self, path):
-        """Regroupement des logs WiFi en Sessions [Start, End]"""
-        df = self.spark.read.parquet(path)
-        
-        # Détection changement IP ou trou temporel
-        w = Window.partitionBy("phone_id", "ip", "user_radius").orderBy("timestamp")
-        
-        df = df.withColumn("prev_ts", F.lag("timestamp").over(w))
-        df = df.withColumn("is_new_session", 
-            F.when(
-                (F.col("timestamp").cast("long") - F.col("prev_ts").cast("long")) > (self.cfg.session_gap_minutes * 60), 
-                1
-            ).otherwise(0)
-        )
-        
-        # ID unique de session
-        df = df.withColumn("session_id", F.sum("is_new_session").over(w))
-        
-        # Aggregation
-        return df.groupBy("phone_id", "ip", "user_radius", "session_id") \
-                 .agg(
-                     F.min("timestamp").alias("s_start"),
-                     F.max("timestamp").alias("s_end")
-                 )
-
-    def _anchor_gps_to_sessions(self, df_sessions, df_gps):
-        """Attache le meilleur GPS à chaque session WiFi"""
-        
-        # 1. Jointure Range (Optimisée)
-        # On ne garde que les GPS dans la fenêtre temporelle de la session (+/- buffer)
-        cond = (df_sessions.phone_id == df_gps.phone_id) & \
-               (df_gps.timestamp >= df_sessions.s_start - self.cfg.gps_time_window_sec) & \
-               (df_gps.timestamp <= df_sessions.s_end + self.cfg.gps_time_window_sec)
-        
-        joined = df_sessions.join(df_gps, cond, "inner")
-        
-        # 2. Calcul des métriques de la session (Scatter & Decay)
-        # On calcule l'écart temporel moyen pour cette session
-        mid_session = (F.col("s_start").cast("long") + F.col("s_end").cast("long")) / 2
-        joined = joined.withColumn("time_gap", F.abs(F.col("timestamp").cast("long") - mid_session))
-        
-        # 3. Aggregation par session (Utilisation de la MEDIANE pour robustesse)
-        # On calcule le centroïde (médiane lat/lon) et la dispersion (stddev)
-        session_locs = joined.groupBy("ip", "user_radius").agg(
-            F.expr("percentile_approx(lat, 0.5)").alias("net_lat"),
-            F.expr("percentile_approx(lon, 0.5)").alias("net_lon"),
-            F.stddev("lat").alias("lat_std"), # Proxy simple pour le scatter
-            F.min("time_gap").alias("min_time_gap"),
-            F.count("*").alias("gps_count"),
-            F.countDistinct("phone_id").alias("device_count")
-        )
-        
-        # 4. Filtrage Qualité (CGNAT & Noise Filter)
-        # Si trop de devices sur l'IP -> Blacklist
-        # Si trop de dispersion géographique -> Mauvaise qualité
-        # Si pas assez de points GPS -> Pas fiable
-        valid_networks = session_locs.filter(
-            (F.col("device_count") < self.cfg.cgnat_device_threshold) & 
-            (F.col("lat_std") < 0.005) & # ~500m approx en degrés
-            (F.col("gps_count") >= self.cfg.min_gps_points)
-        )
-        
-        # Calcul du score final du réseau
-        return valid_networks.withColumn(
-            "net_score", 
-            temporal_decay_score(F.col("min_time_gap"), self.cfg.decay_halflife_min)
-        )
-
-    def _infer_cameras(self, path_cam, df_networks):
-        """Propagation aux caméras"""
-        df_cam = self.spark.read.parquet(path_cam)
-        
-        # BRANCHE A: RADIUS (Prioritaire)
-        safe_nets = df_networks.filter(F.col("user_radius").isNotNull())
-        matches_safe = df_cam.filter(F.col("user_radius").isNotNull()) \
-                             .join(safe_nets, ["ip", "user_radius"], "inner") \
-                             .withColumn("final_score", F.col("net_score") * self.cfg.weight_radius) \
-                             .withColumn("method", F.lit("radius"))
-
-        # BRANCHE B: IP ONLY (Dégradée)
-        # On prend les réseaux qui n'ont PAS de user_radius connu côté réseau
-        risky_nets = df_networks.drop("user_radius")
-        matches_risky = df_cam.filter(F.col("user_radius").isNull()) \
-                              .join(risky_nets, "ip", "inner") \
-                              .withColumn("final_score", F.col("net_score") * self.cfg.weight_ip_only) \
-                              .withColumn("method", F.lit("ip_only"))
-        
-        return matches_safe.unionByName(matches_risky)
-
-    def _merge_gold(self, df_candidates, path_gold):
-        """Strategie Best-Record-Wins"""
-        try:
-            df_history = self.spark.read.parquet(path_gold)
-        except:
-            df_history = self.spark.createDataFrame([], df_candidates.schema)
-
-        # On combine tout
-        df_all = df_history.unionByName(df_candidates, allowMissingColumns=True)
-        
-        # TRI INTELLIGENT
-        # 1. Méthode (Radius > IP)
-        # 2. Score (Proximité temporelle)
-        # 3. Récence (Si égalité, le plus récent gagne)
-        w = Window.partitionBy("camera_id").orderBy(
-            F.when(F.col("method") == "radius", 2).otherwise(1).desc(),
-            F.col("final_score").desc(),
-            F.col("timestamp").desc()
-        )
-        
-        df_final = df_all.withColumn("rank", F.row_number().over(w)) \
-                         .filter(F.col("rank") == 1) \
-                         .drop("rank")
-        
-        # Sauvegarde
-        df_final.write.mode("overwrite").parquet(path_gold)
-        print("Gold Updated.")
-
-# =============================================================================
-# EXECUTION
-# =============================================================================
-
-if __name__ == "__main__":
-    spark = SparkSession.builder.appName("CameraGeolocFinal").getOrCreate()
-    
-    pipeline = CameraInferencePipeline(spark)
-    
-    paths = {
-        "camera": "hdfs://.../raw/camera/",
-        "wifi":   "hdfs://.../raw/phone_wifi/",
-        "gps":    "hdfs://.../raw/phone_gps/",
-        "gold":   "hdfs://.../gold/camera_master/"
-    }
-    
-    pipeline.run(paths)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--date", type=str, default=datetime.now().strftime("%Y-%m-%d"))
+    args = parser.parse_args()
+    run_pipeline(datetime.strptime(args.date, "%Y-%m-%d"))
