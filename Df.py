@@ -41,9 +41,10 @@ class Config:
 
     # Scoring
     MAIN_LOGIC_SCORE = 100.0          # mainLogic always gets this score
-    BASE_SCORE_SINGLE_LOGIC = 20.0    # one logic alone, no convergence
-    CONVERGENCE_BONUS_PER_LOGIC = 15.0 # bonus per additional converging logic
+    BASE_SCORE_SINGLE_LOGIC = 20.0    # isolated logic (no comparison) or alternative
     MAX_SCORE_WITHOUT_MAIN = 85.0     # cap — only mainLogic can reach 100
+    # Proportional: score = (num_contributing / total_logics) × MAX_SCORE_WITHOUT_MAIN
+    # Isolated (1 logic, no verification) stays at BASE_SCORE_SINGLE_LOGIC
 
     # GPS linking
     GPS_WINDOW_SECONDS = 900
@@ -650,6 +651,21 @@ class ConvergenceEngine:
         # ── A) mainLogic rows (1 row per camera that has mainLogic) ─────
         main_rows = (
             enriched.filter(F.col("role") == "main")
+            .withColumn(
+                "logic_details",
+                F.to_json(
+                    F.struct(
+                        F.col("logic_name").alias("logic"),
+                        "lat", "lon",
+                        "logic_confidence",
+                        "num_evidence_points",
+                        "metadata"
+                    )
+                )
+            )
+            # Wrap single detail into a JSON array string: [{ ... }]
+            .withColumn("logic_details",
+                        F.concat(F.lit("["), F.col("logic_details"), F.lit("]")))
             .select(
                 "camera_id",
                 "lat",
@@ -664,14 +680,37 @@ class ConvergenceEngine:
                 "total_logics_for_camera",
                 F.lit("high").alias("confidence_flag"),
                 "metadata",
+                "logic_details",
             )
         )
 
         # ── B) Primary cluster → FUSED into 1 row (weighted centroid) ──
+        #
+        # logic_details: JSON array with each logic's individual data
+        # Score: proportional = (num_contributing / total_logics) × MAX_SCORE
+        #        but isolated (total=1) stays at BASE_SCORE
+
         primary_members = enriched.filter(F.col("role") == "primary_member")
 
-        fused_primary = (
+        # Build per-logic JSON struct BEFORE groupBy
+        primary_with_detail = (
             primary_members
+            .withColumn(
+                "_logic_json",
+                F.to_json(
+                    F.struct(
+                        F.col("logic_name").alias("logic"),
+                        "lat", "lon",
+                        "logic_confidence",
+                        "num_evidence_points",
+                        "metadata"
+                    )
+                )
+            )
+        )
+
+        fused_primary = (
+            primary_with_detail
             .groupBy("camera_id", "total_logics_for_camera")
             .agg(
                 # Weighted centroid
@@ -686,17 +725,22 @@ class ConvergenceEngine:
                 F.max("logic_confidence").alias("logic_confidence"),
                 F.sum("num_evidence_points").alias("num_evidence_points"),
                 F.count("*").alias("num_contributing_logics"),
-                F.max("num_converging").alias("max_converging"),
-                # Collect all metadata as JSON array
-                F.concat_ws(" | ", F.collect_list("metadata")).alias("metadata"),
+                # Collect individual logic details as JSON array string
+                F.concat(
+                    F.lit("["),
+                    F.concat_ws(",", F.collect_list("_logic_json")),
+                    F.lit("]")
+                ).alias("logic_details"),
+                # Keep first metadata for backward compat
+                F.first("metadata").alias("metadata"),
             )
+            # Proportional score: (contributing / total) × MAX
             .withColumn(
                 "final_score",
                 F.least(
                     F.lit(config.MAX_SCORE_WITHOUT_MAIN),
-                    F.lit(config.BASE_SCORE_SINGLE_LOGIC)
-                    + F.lit(config.CONVERGENCE_BONUS_PER_LOGIC)
-                      * (F.col("num_contributing_logics") - 1)
+                    (F.col("num_contributing_logics") / F.col("total_logics_for_camera"))
+                    * F.lit(config.MAX_SCORE_WITHOUT_MAIN)
                 )
             )
             .withColumn("is_best_location", F.lit(True))
@@ -712,13 +756,27 @@ class ConvergenceEngine:
                 "logic_confidence", "num_evidence_points", "final_score",
                 "is_best_location", "convergence_group",
                 "num_contributing_logics", "total_logics_for_camera",
-                "confidence_flag", "metadata",
+                "confidence_flag", "metadata", "logic_details",
             )
         )
 
         # ── C) Alternative rows (1 row each, kept as-is) ───────────────
         alternative_rows = (
             enriched.filter(F.col("role") == "alternative")
+            .withColumn(
+                "logic_details",
+                F.concat(
+                    F.lit("["),
+                    F.to_json(F.struct(
+                        F.col("logic_name").alias("logic"),
+                        "lat", "lon",
+                        "logic_confidence",
+                        "num_evidence_points",
+                        "metadata"
+                    )),
+                    F.lit("]")
+                )
+            )
             .select(
                 "camera_id",
                 "lat",
@@ -733,12 +791,27 @@ class ConvergenceEngine:
                 "total_logics_for_camera",
                 F.lit("low_confidence").alias("confidence_flag"),
                 "metadata",
+                "logic_details",
             )
         )
 
         # ── D) Isolated rows (single logic, no comparison) ─────────────
         isolated_rows = (
             enriched.filter(F.col("role") == "isolated")
+            .withColumn(
+                "logic_details",
+                F.concat(
+                    F.lit("["),
+                    F.to_json(F.struct(
+                        F.col("logic_name").alias("logic"),
+                        "lat", "lon",
+                        "logic_confidence",
+                        "num_evidence_points",
+                        "metadata"
+                    )),
+                    F.lit("]")
+                )
+            )
             .select(
                 "camera_id",
                 "lat",
@@ -753,6 +826,7 @@ class ConvergenceEngine:
                 "total_logics_for_camera",
                 F.lit("low_confidence").alias("confidence_flag"),
                 "metadata",
+                "logic_details",
             )
         )
 
@@ -841,6 +915,7 @@ class ConvergenceEngine:
             "total_logics_for_camera",
             "confidence_flag",
             "metadata",
+            "logic_details",
         )
 
         return final
