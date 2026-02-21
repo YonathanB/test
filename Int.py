@@ -1,1002 +1,1325 @@
-"""
-Multi-Logic Camera Geolocation Framework
-==========================================
-Extensible framework where N independent localization logics each produce
-candidate locations for cameras. A convergence engine scores results based
-on how many logics agree.
-
-Rules:
-  - mainLogic fires → score = 100, all other logics for that camera are DROPPED
-  - Otherwise: all logics kept, convergence within a radius boosts score
-  - Non-converging cameras flagged as 'low_confidence'
-
-Usage:
-  spark-submit multi_logic_geolocation.py --date 2025-06-15
-
-Adding a new logic:
-  1. Create a class that extends BaseLocalizationLogic
-  2. Implement the `run()` method → returns DataFrame[camera_id, lat, lon, logic_name, ...]
-  3. Register it in the LOGIC_REGISTRY
-"""
-
-from abc import ABC, abstractmethod
-from pyspark.sql import SparkSession, DataFrame, Window
-from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType, StructField, StringType, DoubleType,
-    IntegerType, FloatType, DateType, TimestampType
-)
-import math
-from datetime import datetime
-import argparse
-
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-class Config:
-    # Convergence radius in meters — two logics agreeing within this = convergence
-    CONVERGENCE_RADIUS_METERS = 100
-
-    # Scoring
-    MAIN_LOGIC_SCORE = 100.0          # mainLogic always gets this score
-    BASE_SCORE_SINGLE_LOGIC = 20.0    # one logic alone, no convergence
-    CONVERGENCE_BONUS_PER_LOGIC = 15.0 # bonus per additional converging logic
-    MAX_SCORE_WITHOUT_MAIN = 85.0     # cap — only mainLogic can reach 100
-
-    # GPS linking
-    GPS_WINDOW_SECONDS = 900
-    TEMPORAL_DECAY_HALF_LIFE = 300
-
-    # CGNAT
-    CGNAT_USER_THRESHOLD = 5
-
-    # Spatial quality
-    MIN_SESSIONS = 3
-    MAX_SPATIAL_IQR_METERS = 200
-
-    # Paths
-    CAMERA_LOGS_PATH = "/data/raw/camera_logs"
-    PHONE_WIFI_PATH = "/data/raw/phone_wifi_logs"
-    PHONE_GPS_PATH = "/data/raw/phone_gps"
-    SILVER_PATH = "/data/silver/camera_locations"
-    GOLD_PATH = "/data/gold/camera_locations"
-
-    # Main logic name — this is the authority
-    MAIN_LOGIC_NAME = "mainLogic"
-
-
-# =============================================================================
-# STANDARD OUTPUT SCHEMA — All logics MUST produce this
-# =============================================================================
-
-LOGIC_OUTPUT_SCHEMA = StructType([
-    StructField("camera_id", StringType(), False),
-    StructField("lat", DoubleType(), False),
-    StructField("lon", DoubleType(), False),
-    StructField("logic_name", StringType(), False),
-    StructField("logic_confidence", DoubleType(), True),   # 0.0 - 1.0, logic's self-assessed confidence
-    StructField("num_evidence_points", IntegerType(), True),
-    StructField("metadata", StringType(), True),            # JSON string for logic-specific info
-])
-
-
-# =============================================================================
-# UDF — Haversine
-# =============================================================================
-
-@F.udf(DoubleType())
-def haversine_meters(lat1, lon1, lat2, lon2):
-    if any(v is None for v in [lat1, lon1, lat2, lon2]):
-        return None
-    R = 6_371_000
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = (math.sin(dphi / 2) ** 2
-         + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-
-# =============================================================================
-# BASE CLASS — All logics extend this
-# =============================================================================
-
-class BaseLocalizationLogic(ABC):
-    """
-    Abstract base class for a localization logic.
-    Each logic independently attempts to locate cameras.
-
-    Subclasses must implement:
-      - name: str property
-      - run(spark, run_date, config) -> DataFrame matching LOGIC_OUTPUT_SCHEMA
-    """
-
-    @property
-    @abstractmethod
-    def name(self) -> str:
-        """Unique name for this logic. 'mainLogic' has special authority."""
-        pass
-
-    @abstractmethod
-    def run(self, spark: SparkSession, run_date: datetime, config: Config) -> DataFrame:
-        """
-        Execute this logic and return candidate locations.
-
-        Must return a DataFrame with columns:
-          camera_id, lat, lon, logic_name, logic_confidence,
-          num_evidence_points, metadata
-        """
-        pass
-
-    def validate_output(self, df: DataFrame) -> DataFrame:
-        """Ensure the output conforms to the expected schema."""
-        required_cols = {"camera_id", "lat", "lon", "logic_name"}
-        actual_cols = set(df.columns)
-        missing = required_cols - actual_cols
-        if missing:
-            raise ValueError(f"Logic '{self.name}' output missing columns: {missing}")
-        return df
-
-
-# =============================================================================
-# LOGIC 1: mainLogic — ISP Radius ID Co-location (Highest Authority)
-# =============================================================================
-
-class MainLogic(BaseLocalizationLogic):
-    """
-    The authoritative logic. Matches cameras to phones via User_Radius_ID
-    (same ISP account = same household). Links to GPS with temporal proximity.
-
-    When this logic fires for a camera, its score is 100 and all other
-    logics for that camera are discarded.
-    """
-
-    @property
-    def name(self) -> str:
-        return "mainLogic"
-
-    def run(self, spark, run_date, config):
-        date_str = run_date.strftime("%Y-%m-%d")
-
-        camera_df = spark.read.parquet(config.CAMERA_LOGS_PATH)
-        phone_wifi_df = spark.read.parquet(config.PHONE_WIFI_PATH)
-        phone_gps_df = spark.read.parquet(config.PHONE_GPS_PATH)
-
-        # Camera has Radius ID → match to phone with same Radius ID on same IP
-        cam_day = (
-            camera_df
-            .filter(F.to_date("timestamp") == F.lit(date_str))
-            .filter(F.col("User_Radius_ID").isNotNull())
-        )
-
-        phone_day = phone_wifi_df.filter(F.to_date("timestamp") == F.lit(date_str))
-        gps_day = phone_gps_df.filter(F.to_date("timestamp") == F.lit(date_str))
-
-        # Network match on Radius ID + IP
-        matches = (
-            cam_day.alias("c")
-            .join(
-                phone_day.alias("p"),
-                (F.col("c.User_Radius_ID") == F.col("p.User_Radius_ID"))
-                & (F.col("c.ip") == F.col("p.ip")),
-                "inner"
-            )
-            .select(
-                F.col("c.ip").alias("camera_id"),
-                F.col("p.timestamp").alias("phone_timestamp"),
-                F.col("p.User_Radius_ID").alias("phone_radius_id"),
-            )
-        )
-
-        # Link to GPS within time window
-        matches_ts = matches.withColumn("phone_epoch", F.col("phone_timestamp").cast("long"))
-        gps_ts = gps_day.withColumn("gps_epoch", F.col("timestamp").cast("long"))
-
-        gps_linked = (
-            matches_ts.alias("m")
-            .join(
-                gps_ts.alias("g"),
-                (F.col("m.phone_radius_id") == F.col("g.User_Radius_ID"))
-                & (F.abs(F.col("g.gps_epoch") - F.col("m.phone_epoch")) <= config.GPS_WINDOW_SECONDS),
-                "inner"
-            )
-            .withColumn("time_delta", F.abs(F.col("g.gps_epoch") - F.col("m.phone_epoch")))
-        )
-
-        # Keep closest GPS per match
-        w = Window.partitionBy("camera_id", "phone_timestamp").orderBy("time_delta")
-        best = (
-            gps_linked
-            .withColumn("rn", F.row_number().over(w))
-            .filter(F.col("rn") == 1)
-        )
-
-        # Aggregate per camera — median centroid
-        result = (
-            best
-            .groupBy("camera_id")
-            .agg(
-                F.percentile_approx("g.lat", 0.5).alias("lat"),
-                F.percentile_approx("g.lon", 0.5).alias("lon"),
-                F.count("*").alias("num_evidence_points"),
-                F.avg(
-                    F.exp(-F.log(F.lit(2.0)) * F.col("time_delta") / F.lit(config.TEMPORAL_DECAY_HALF_LIFE))
-                ).alias("logic_confidence"),
-            )
-            .filter(F.col("num_evidence_points") >= config.MIN_SESSIONS)
-            .withColumn("logic_name", F.lit(self.name))
-            .withColumn("logic_confidence", F.least(F.lit(1.0), F.col("logic_confidence")))
-            .withColumn("metadata", F.lit('{"method": "radius_id_colocation"}'))
-            .select("camera_id", "lat", "lon", "logic_name",
-                    "logic_confidence", "num_evidence_points", "metadata")
-        )
-
-        return self.validate_output(result)
-
-
-# =============================================================================
-# LOGIC 2: Residential IP Co-location (Tier 2)
-# =============================================================================
-
-class ResidentialIPLogic(BaseLocalizationLogic):
-    """
-    For cameras WITHOUT a Radius ID: match by IP, but only on IPs
-    classified as residential (not CGNAT).
-    """
-
-    @property
-    def name(self) -> str:
-        return "residentialIPLogic"
-
-    def run(self, spark, run_date, config):
-        date_str = run_date.strftime("%Y-%m-%d")
-
-        camera_df = spark.read.parquet(config.CAMERA_LOGS_PATH)
-        phone_wifi_df = spark.read.parquet(config.PHONE_WIFI_PATH)
-        phone_gps_df = spark.read.parquet(config.PHONE_GPS_PATH)
-
-        # Profile IPs
-        ip_profile = (
-            phone_wifi_df
-            .filter(F.col("User_Radius_ID").isNotNull())
-            .filter(F.to_date("timestamp") == F.lit(date_str))
-            .groupBy("ip")
-            .agg(F.countDistinct("User_Radius_ID").alias("distinct_users"))
-            .filter(F.col("distinct_users") <= config.CGNAT_USER_THRESHOLD)
-            .select("ip")
-        )
-
-        cam_day = (
-            camera_df
-            .filter(F.to_date("timestamp") == F.lit(date_str))
-            .filter(F.col("User_Radius_ID").isNull())
-        )
-
-        phone_day = phone_wifi_df.filter(F.to_date("timestamp") == F.lit(date_str))
-        gps_day = phone_gps_df.filter(F.to_date("timestamp") == F.lit(date_str))
-
-        # IP match on residential IPs only
-        matches = (
-            cam_day.alias("c")
-            .join(ip_profile.alias("ipr"), F.col("c.ip") == F.col("ipr.ip"), "inner")
-            .join(phone_day.alias("p"), F.col("c.ip") == F.col("p.ip"), "inner")
-            .select(
-                F.col("c.ip").alias("camera_id"),
-                F.col("p.timestamp").alias("phone_timestamp"),
-                F.col("p.User_Radius_ID").alias("phone_radius_id"),
-            )
-        )
-
-        # GPS linking (same pattern as mainLogic)
-        matches_ts = matches.withColumn("phone_epoch", F.col("phone_timestamp").cast("long"))
-        gps_ts = gps_day.withColumn("gps_epoch", F.col("timestamp").cast("long"))
-
-        gps_linked = (
-            matches_ts.alias("m")
-            .join(
-                gps_ts.alias("g"),
-                (F.col("m.phone_radius_id") == F.col("g.User_Radius_ID"))
-                & (F.abs(F.col("g.gps_epoch") - F.col("m.phone_epoch")) <= config.GPS_WINDOW_SECONDS),
-                "inner"
-            )
-            .withColumn("time_delta", F.abs(F.col("g.gps_epoch") - F.col("m.phone_epoch")))
-        )
-
-        w = Window.partitionBy("camera_id", "phone_timestamp").orderBy("time_delta")
-        best = gps_linked.withColumn("rn", F.row_number().over(w)).filter(F.col("rn") == 1)
-
-        result = (
-            best
-            .groupBy("camera_id")
-            .agg(
-                F.percentile_approx("g.lat", 0.5).alias("lat"),
-                F.percentile_approx("g.lon", 0.5).alias("lon"),
-                F.count("*").alias("num_evidence_points"),
-                F.avg(
-                    F.exp(-F.log(F.lit(2.0)) * F.col("time_delta") / F.lit(config.TEMPORAL_DECAY_HALF_LIFE))
-                ).alias("logic_confidence"),
-            )
-            .filter(F.col("num_evidence_points") >= config.MIN_SESSIONS)
-            .withColumn("logic_name", F.lit(self.name))
-            .withColumn("logic_confidence",
-                        F.least(F.lit(1.0), F.col("logic_confidence") * 0.7))  # penalize vs mainLogic
-            .withColumn("metadata", F.lit('{"method": "residential_ip_colocation"}'))
-            .select("camera_id", "lat", "lon", "logic_name",
-                    "logic_confidence", "num_evidence_points", "metadata")
-        )
-
-        return self.validate_output(result)
-
-
-# =============================================================================
-# LOGIC 3: Recurring Co-location Pattern (Multi-day)
-# =============================================================================
-
-class RecurringColocationLogic(BaseLocalizationLogic):
-    """
-    Looks at the past 7 days of IP co-location data (any tier).
-    If a camera repeatedly appears on the same network as phones that
-    cluster around the same GPS point across multiple days, that's a
-    strong signal even if each individual day is weak.
-    """
-
-    @property
-    def name(self) -> str:
-        return "recurringColocationLogic"
-
-    def run(self, spark, run_date, config):
-        from datetime import timedelta
-
-        camera_df = spark.read.parquet(config.CAMERA_LOGS_PATH)
-        phone_wifi_df = spark.read.parquet(config.PHONE_WIFI_PATH)
-        phone_gps_df = spark.read.parquet(config.PHONE_GPS_PATH)
-
-        start_date = (run_date - timedelta(days=7)).strftime("%Y-%m-%d")
-        end_date = run_date.strftime("%Y-%m-%d")
-
-        # 7-day window
-        cam_window = camera_df.filter(
-            (F.to_date("timestamp") >= F.lit(start_date))
-            & (F.to_date("timestamp") <= F.lit(end_date))
-        )
-        phone_window = phone_wifi_df.filter(
-            (F.to_date("timestamp") >= F.lit(start_date))
-            & (F.to_date("timestamp") <= F.lit(end_date))
-        )
-        gps_window = phone_gps_df.filter(
-            (F.to_date("timestamp") >= F.lit(start_date))
-            & (F.to_date("timestamp") <= F.lit(end_date))
-        )
-
-        # Match on IP (both with and without Radius ID)
-        matches = (
-            cam_window.alias("c")
-            .join(phone_window.alias("p"), F.col("c.ip") == F.col("p.ip"), "inner")
-            .filter(F.col("p.User_Radius_ID").isNotNull())
-            .select(
-                F.col("c.ip").alias("camera_id"),
-                F.col("p.timestamp").alias("phone_timestamp"),
-                F.col("p.User_Radius_ID").alias("phone_radius_id"),
-                F.to_date("c.timestamp").alias("match_date"),
-            )
-        )
-
-        # GPS link
-        matches_ts = matches.withColumn("phone_epoch", F.col("phone_timestamp").cast("long"))
-        gps_ts = gps_window.withColumn("gps_epoch", F.col("timestamp").cast("long"))
-
-        gps_linked = (
-            matches_ts.alias("m")
-            .join(
-                gps_ts.alias("g"),
-                (F.col("m.phone_radius_id") == F.col("g.User_Radius_ID"))
-                & (F.abs(F.col("g.gps_epoch") - F.col("m.phone_epoch")) <= config.GPS_WINDOW_SECONDS),
-                "inner"
-            )
-            .withColumn("time_delta", F.abs(F.col("g.gps_epoch") - F.col("m.phone_epoch")))
-        )
-
-        w = Window.partitionBy("camera_id", "phone_timestamp").orderBy("time_delta")
-        best = gps_linked.withColumn("rn", F.row_number().over(w)).filter(F.col("rn") == 1)
-
-        # Require data from at least 3 distinct days
-        result = (
-            best
-            .groupBy("camera_id")
-            .agg(
-                F.percentile_approx("g.lat", 0.5).alias("lat"),
-                F.percentile_approx("g.lon", 0.5).alias("lon"),
-                F.count("*").alias("num_evidence_points"),
-                F.countDistinct("match_date").alias("distinct_days"),
-                F.avg(
-                    F.exp(-F.log(F.lit(2.0)) * F.col("time_delta") / F.lit(config.TEMPORAL_DECAY_HALF_LIFE))
-                ).alias("logic_confidence"),
-            )
-            .filter(F.col("distinct_days") >= 3)
-            .withColumn("logic_name", F.lit(self.name))
-            .withColumn("logic_confidence",
-                        F.least(F.lit(1.0), F.col("logic_confidence") * 0.8))
-            .withColumn("metadata",
-                        F.concat(F.lit('{"method":"recurring_7day","distinct_days":'),
-                                 F.col("distinct_days").cast(StringType()),
-                                 F.lit('}')))
-            .select("camera_id", "lat", "lon", "logic_name",
-                    "logic_confidence", "num_evidence_points", "metadata")
-        )
-
-        return self.validate_output(result)
-
-
-# =============================================================================
-# LOGIC 4: Stub — Add your own logic here
-# =============================================================================
-
-class ExampleCustomLogic(BaseLocalizationLogic):
-    """
-    TEMPLATE: Copy this class to add a new localization logic.
-    Examples of what you could implement:
-      - Reverse DNS / hostname-based geolocation
-      - IP geolocation database lookup (MaxMind, etc.)
-      - Camera MAC OUI + known deployment databases
-      - Network topology inference from traceroute-like data
-    """
-
-    @property
-    def name(self) -> str:
-        return "customLogicExample"
-
-    def run(self, spark, run_date, config):
-        # Return an empty DataFrame with the correct schema
-        return spark.createDataFrame([], LOGIC_OUTPUT_SCHEMA)
-
-
-# =============================================================================
-# LOGIC REGISTRY — Add new logics here
-# =============================================================================
-
-LOGIC_REGISTRY = [
-    MainLogic(),
-    ResidentialIPLogic(),
-    RecurringColocationLogic(),
-    # ExampleCustomLogic(),       # <-- uncomment or add yours here
-]
-
-
-# =============================================================================
-# CONVERGENCE ENGINE
-# =============================================================================
-
-class ConvergenceEngine:
-    """
-    Takes outputs from all logics and produces ONE ROW PER LOGIC PER CAMERA.
-    Every logic result is KEPT. Nothing is dropped.
-
-    Output columns per row:
-      - camera_id, lat, lon, logic_name            → the logic's own result
-      - final_score                                  → scored (100 for mainLogic)
-      - is_best_location (bool)                      → True for the winning row
-      - convergence_group                            → 'primary'|'alternative'|'isolated'
-      - converges_with         (list of logic names) → which other logics agree
-      - alternative_locations  (list of logic names) → which logics disagree
-      - best_location_logics   (list of logic names) → what the "best" is, for reference
-      - confidence_flag                              → high / medium / low_confidence
-
-    Rules:
-      - mainLogic → score=100, is_best=True. Other logics for that camera
-        are KEPT but marked convergence_group='alternative' and point to
-        mainLogic via best_location_logics. mainLogic also lists them in
-        alternative_locations.
-      - No mainLogic → convergence check. Converging logics form the
-        'primary' group (best). Non-converging logics are 'alternative'.
-        Both sides cross-reference each other.
-      - Camera with only one logic → 'isolated', low confidence.
-    """
-
-    def __init__(self, config: Config):
-        self.config = config
-
-    def score_and_merge(self, all_candidates: DataFrame, spark: SparkSession) -> DataFrame:
-        config = self.config
-
-        # =================================================================
-        # PHASE 1: Assign a unique row_id to every candidate
-        # =================================================================
-        candidates = all_candidates.withColumn(
-            "row_id",
-            F.monotonically_increasing_id()
-        )
-
-        # =================================================================
-        # PHASE 2: Pairwise distances (ALL logics, ALL cameras)
-        # =================================================================
-        left = candidates.alias("a")
-        right = candidates.alias("b")
-
-        pairs = (
-            left.join(
-                right,
-                (F.col("a.camera_id") == F.col("b.camera_id"))
-                & (F.col("a.row_id") < F.col("b.row_id")),
-                "inner"
-            )
-            .withColumn(
-                "distance_m",
-                haversine_meters(
-                    F.col("a.lat"), F.col("a.lon"),
-                    F.col("b.lat"), F.col("b.lon")
-                )
-            )
-            .withColumn(
-                "within_radius",
-                F.col("distance_m") <= config.CONVERGENCE_RADIUS_METERS
-            )
-            .select(
-                F.col("a.camera_id").alias("camera_id"),
-                F.col("a.logic_name").alias("logic_a"),
-                F.col("b.logic_name").alias("logic_b"),
-                "distance_m",
-                "within_radius",
-            )
-        )
-
-        # =================================================================
-        # PHASE 3: Build "converges_with" and "diverges_from" per logic
-        # =================================================================
-
-        # Converging pairs (bidirectional)
-        conv_from_a = (
-            pairs.filter(F.col("within_radius"))
-            .select(
-                "camera_id",
-                F.col("logic_a").alias("logic_name"),
-                F.col("logic_b").alias("converges_with_logic"),
-            )
-        )
-        conv_from_b = (
-            pairs.filter(F.col("within_radius"))
-            .select(
-                "camera_id",
-                F.col("logic_b").alias("logic_name"),
-                F.col("logic_a").alias("converges_with_logic"),
-            )
-        )
-        all_convergences = conv_from_a.unionByName(conv_from_b)
-
-        # Diverging pairs (bidirectional)
-        div_from_a = (
-            pairs.filter(~F.col("within_radius"))
-            .select(
-                "camera_id",
-                F.col("logic_a").alias("logic_name"),
-                F.col("logic_b").alias("diverges_from_logic"),
-            )
-        )
-        div_from_b = (
-            pairs.filter(~F.col("within_radius"))
-            .select(
-                "camera_id",
-                F.col("logic_b").alias("logic_name"),
-                F.col("logic_a").alias("diverges_from_logic"),
-            )
-        )
-        all_divergences = div_from_a.unionByName(div_from_b)
-
-        # Aggregate per (camera_id, logic_name)
-        conv_agg = (
-            all_convergences
-            .groupBy("camera_id", "logic_name")
-            .agg(
-                F.collect_set("converges_with_logic").alias("converges_with"),
-                F.count("*").alias("num_converging"),
-            )
-        )
-
-        div_agg = (
-            all_divergences
-            .groupBy("camera_id", "logic_name")
-            .agg(
-                F.collect_set("diverges_from_logic").alias("diverges_from"),
-            )
-        )
-
-        # =================================================================
-        # PHASE 4: Enrich every candidate row
-        # =================================================================
-        enriched = (
-            candidates
-            .join(conv_agg, ["camera_id", "logic_name"], "left")
-            .join(div_agg, ["camera_id", "logic_name"], "left")
-            .withColumn("converges_with",
-                        F.coalesce(F.col("converges_with"), F.array()))
-            .withColumn("diverges_from",
-                        F.coalesce(F.col("diverges_from"), F.array()))
-            .withColumn("num_converging",
-                        F.coalesce(F.col("num_converging"), F.lit(0)))
-        )
-
-        # =================================================================
-        # PHASE 5: Determine best location group per camera
-        # =================================================================
-        # Count logics per camera
-        logic_count_per_camera = (
-            candidates
-            .groupBy("camera_id")
-            .agg(F.count("*").alias("total_logics_for_camera"))
-        )
-        enriched = enriched.join(logic_count_per_camera, "camera_id", "left")
-
-        # Has mainLogic?
-        has_main = (
-            candidates
-            .filter(F.col("logic_name") == config.MAIN_LOGIC_NAME)
-            .select("camera_id")
-            .distinct()
-            .withColumn("has_main_logic", F.lit(True))
-        )
-        enriched = (
-            enriched
-            .join(has_main, "camera_id", "left")
-            .withColumn("has_main_logic",
-                        F.coalesce(F.col("has_main_logic"), F.lit(False)))
-        )
-
-        # For cameras WITHOUT mainLogic: find the "primary" group
-        # = the largest set of mutually converging logics
-        # Approximation: the logic with the most convergences anchors the group
-        best_convergence_per_camera = (
-            enriched
-            .filter(~F.col("has_main_logic"))
-            .groupBy("camera_id")
-            .agg(F.max("num_converging").alias("max_converging"))
-        )
-
-        # All logics in the "primary" cluster = those that converge with
-        # the best-connected logic (or are the best-connected logic)
-        primary_anchor = (
-            enriched
-            .filter(~F.col("has_main_logic"))
-            .join(best_convergence_per_camera, "camera_id", "inner")
-            .filter(
-                (F.col("num_converging") == F.col("max_converging"))
-                & (F.col("num_converging") > 0)
-            )
-            .groupBy("camera_id")
-            .agg(
-                # Collect all logics that are part of the best convergence cluster
-                F.array_distinct(
-                    F.flatten(
-                        F.array(
-                            F.collect_set("logic_name"),
-                            F.flatten(F.collect_list("converges_with"))
-                        )
-                    )
-                ).alias("primary_logics")
-            )
-        )
-
-        enriched = enriched.join(primary_anchor, "camera_id", "left")
-
-        # =================================================================
-        # PHASE 6: Assign convergence_group, score, cross-references
-        # =================================================================
-        scored = (
-            enriched
-            .withColumn(
-                "convergence_group",
-                F.when(
-                    # mainLogic cameras: mainLogic is primary, others are alternative
-                    F.col("has_main_logic") & (F.col("logic_name") == config.MAIN_LOGIC_NAME),
-                    F.lit("primary")
-                ).when(
-                    F.col("has_main_logic") & (F.col("logic_name") != config.MAIN_LOGIC_NAME),
-                    F.lit("alternative")
-                ).when(
-                    # No mainLogic: check if this logic is in the primary cluster
-                    F.col("primary_logics").isNotNull()
-                    & F.array_contains(F.col("primary_logics"), F.col("logic_name")),
-                    F.lit("primary")
-                ).when(
-                    # No mainLogic, not in primary cluster, but primary cluster exists
-                    F.col("primary_logics").isNotNull(),
-                    F.lit("alternative")
-                ).otherwise(
-                    # No convergence at all (solo logic or all logics diverge)
-                    F.lit("isolated")
-                )
-            )
-        )
-
-        # Score
-        scored = scored.withColumn(
-            "final_score",
-            F.when(
-                F.col("logic_name") == config.MAIN_LOGIC_NAME,
-                F.lit(config.MAIN_LOGIC_SCORE)
-            ).when(
-                F.col("convergence_group") == "primary",
-                F.least(
-                    F.lit(config.MAX_SCORE_WITHOUT_MAIN),
-                    F.lit(config.BASE_SCORE_SINGLE_LOGIC)
-                    + F.lit(config.CONVERGENCE_BONUS_PER_LOGIC) * F.col("num_converging")
-                )
-            ).when(
-                F.col("convergence_group") == "alternative",
-                F.lit(config.BASE_SCORE_SINGLE_LOGIC)  # kept but low score
-            ).otherwise(
-                F.lit(config.BASE_SCORE_SINGLE_LOGIC)  # isolated
-            )
-        )
-
-        # is_best_location: True for the highest-scored row per camera
-        best_w = Window.partitionBy("camera_id").orderBy(
-            F.desc("final_score"), F.desc("logic_confidence"), F.desc("num_evidence_points")
-        )
-        scored = (
-            scored
-            .withColumn("_rank", F.row_number().over(best_w))
-            .withColumn("is_best_location", F.col("_rank") == 1)
-        )
-
-        # =================================================================
-        # PHASE 7: Cross-references (bidirectional)
-        # =================================================================
-
-        # For each row, collect the names of logics in the OTHER group(s)
-        # "alternative_locations" = logics that located this camera elsewhere
-        # "best_location_logics" = which logics form the best location
-
-        # Build best-location logics per camera
-        best_logics_per_camera = (
-            scored
-            .filter(F.col("convergence_group") == "primary")
-            .groupBy("camera_id")
-            .agg(F.collect_set("logic_name").alias("best_location_logics"))
-        )
-
-        # Build alternative logics per camera
-        alt_logics_per_camera = (
-            scored
-            .filter(F.col("convergence_group").isin("alternative", "isolated"))
-            .groupBy("camera_id")
-            .agg(F.collect_set("logic_name").alias("alternative_location_logics"))
-        )
-
-        scored = (
-            scored
-            .join(best_logics_per_camera, "camera_id", "left")
-            .join(alt_logics_per_camera, "camera_id", "left")
-        )
-
-        # Now assign the cross-reference columns depending on which group this row is in
-        scored = (
-            scored
-            .withColumn(
-                "alternative_locations",
-                F.when(
-                    F.col("convergence_group") == "primary",
-                    F.coalesce(F.col("alternative_location_logics"), F.array())
-                ).otherwise(
-                    # For alternative/isolated rows: "the best location is from these logics"
-                    F.array()  # they don't point to other alternatives, they point to best
-                )
-            )
-            .withColumn(
-                "best_location_logics",
-                F.when(
-                    F.col("convergence_group").isin("alternative", "isolated"),
-                    F.coalesce(F.col("best_location_logics"), F.array())
-                ).otherwise(
-                    F.array()  # primary rows don't need to reference themselves
-                )
-            )
-        )
-
-        # Confidence flag
-        scored = scored.withColumn(
-            "confidence_flag",
-            F.when(F.col("logic_name") == config.MAIN_LOGIC_NAME, F.lit("high"))
-             .when((F.col("convergence_group") == "primary") & (F.col("num_converging") >= 2),
-                   F.lit("high"))
-             .when((F.col("convergence_group") == "primary") & (F.col("num_converging") == 1),
-                   F.lit("medium"))
-             .when(F.col("convergence_group") == "alternative", F.lit("low_confidence"))
-             .otherwise(F.lit("low_confidence"))
-        )
-
-        # =================================================================
-        # PHASE 8: Final select — clean output
-        # =================================================================
-        final = (
-            scored
-            .withColumn("converges_with_str", F.concat_ws(",", "converges_with"))
-            .withColumn("alternative_locations_str", F.concat_ws(",", "alternative_locations"))
-            .withColumn("best_location_logics_str", F.concat_ws(",", "best_location_logics"))
-            .select(
-                "camera_id",
-                "lat",
-                "lon",
-                "logic_name",
-                "logic_confidence",
-                "num_evidence_points",
-                "final_score",
-                "is_best_location",
-                "convergence_group",
-                F.col("converges_with_str").alias("converges_with"),
-                F.col("alternative_locations_str").alias("alternative_locations"),
-                F.col("best_location_logics_str").alias("best_location_logics"),
-                "num_converging",
-                "total_logics_for_camera",
-                "confidence_flag",
-                "metadata",
-            )
-        )
-
-        return final
-
-
-# =============================================================================
-# GOLD TABLE MERGE
-# =============================================================================
-
-def merge_to_gold(silver_df, spark, config=Config):
-    """
-    Gold table keeps ALL rows (every logic for every camera).
-    Merge strategy: for each camera, compare the BEST score in silver
-    vs the BEST score in gold. If silver is better (or camera is new),
-    replace ALL rows for that camera with silver's rows.
-    Otherwise keep gold's rows.
-
-    This ensures the gold table always has the complete picture
-    (all logics + cross-references) from the best-scoring run.
-    """
-    try:
-        gold_df = spark.read.parquet(config.GOLD_PATH)
-    except Exception:
-        silver_df.write.mode("overwrite").parquet(config.GOLD_PATH)
-        print("[GOLD] Initialized Gold table from Silver.")
-        return silver_df
-
-    # Best score per camera in each table
-    gold_best = (
-        gold_df
-        .groupBy("camera_id")
-        .agg(F.max("final_score").alias("gold_best_score"))
-    )
-    silver_best = (
-        silver_df
-        .groupBy("camera_id")
-        .agg(F.max("final_score").alias("silver_best_score"))
-    )
-
-    # Decide per camera: take silver or keep gold?
-    comparison = (
-        gold_best.alias("g")
-        .join(silver_best.alias("s"), "camera_id", "full_outer")
-        .withColumn(
-            "winner",
-            F.when(F.col("gold_best_score").isNull(), F.lit("silver"))  # new camera
-             .when(F.col("silver_best_score").isNull(), F.lit("gold"))  # no new data
-             .when(F.col("silver_best_score") > F.col("gold_best_score"), F.lit("silver"))
-             .otherwise(F.lit("gold"))
-        )
-        .select("camera_id", "winner")
-    )
-
-    # Cameras where silver wins → take all silver rows
-    silver_winners = comparison.filter(F.col("winner") == "silver").select("camera_id")
-    silver_rows = silver_df.join(silver_winners, "camera_id", "inner")
-
-    # Cameras where gold wins → keep all gold rows
-    gold_winners = comparison.filter(F.col("winner") == "gold").select("camera_id")
-    gold_rows = gold_df.join(gold_winners, "camera_id", "inner")
-
-    # Union
-    final = gold_rows.unionByName(silver_rows, allowMissingColumns=True)
-
-    final.write.mode("overwrite").parquet(config.GOLD_PATH)
-    distinct_cameras = final.select("camera_id").distinct().count()
-    total_rows = final.count()
-    print(f"[GOLD] Merged. {distinct_cameras} cameras, {total_rows} total rows.")
-
-    return final
-
-
-# =============================================================================
-# MAIN PIPELINE
-# =============================================================================
-
-def run_pipeline(run_date, config=Config):
-    spark = (
-        SparkSession.builder
-        .appName(f"MultiLogicGeolocation_{run_date.strftime('%Y%m%d')}")
-        .config("spark.sql.adaptive.enabled", "true")
-        .getOrCreate()
-    )
-
-    print(f"\n{'='*70}")
-    print(f"  Multi-Logic Camera Geolocation — {run_date.strftime('%Y-%m-%d')}")
-    print(f"  Registered logics: {[l.name for l in LOGIC_REGISTRY]}")
-    print(f"{'='*70}\n")
-
-    # ── Run all logics ──────────────────────────────────────────────────
-    all_results = []
-    for logic in LOGIC_REGISTRY:
-        print(f"  [RUNNING] {logic.name}...")
-        try:
-            result = logic.run(spark, run_date, config)
-            count = result.count()
-            print(f"  [DONE]    {logic.name} → {count} cameras located")
-            if count > 0:
-                all_results.append(result)
-        except Exception as e:
-            print(f"  [ERROR]   {logic.name} failed: {e}")
-
-    if not all_results:
-        print("\n  No logics produced results. Exiting.")
-        spark.stop()
-        return
-
-    # Union all logic outputs
-    all_candidates = all_results[0]
-    for df in all_results[1:]:
-        all_candidates = all_candidates.unionByName(df, allowMissingColumns=True)
-
-    print(f"\n  Total candidates across all logics: {all_candidates.count()}")
-
-    # ── Convergence scoring ─────────────────────────────────────────────
-    print("\n  [CONVERGENCE] Scoring...")
-    engine = ConvergenceEngine(config)
-    silver = engine.score_and_merge(all_candidates, spark)
-    silver = silver.withColumn("run_date", F.lit(run_date.strftime("%Y-%m-%d")).cast(DateType()))
-
-    # Print summary
-    print("\n  ── Results Summary ──")
-    distinct_cameras = silver.select("camera_id").distinct().count()
-    total_rows = silver.count()
-    print(f"  Cameras: {distinct_cameras}, Total logic rows: {total_rows}")
-
-    print("\n  By convergence group:")
-    silver.groupBy("convergence_group").agg(
-        F.count("*").alias("rows"),
-        F.countDistinct("camera_id").alias("cameras"),
-        F.round(F.avg("final_score"), 1).alias("avg_score"),
-    ).show()
-
-    print("  By confidence flag:")
-    silver.groupBy("confidence_flag").agg(
-        F.count("*").alias("rows"),
-        F.round(F.avg("final_score"), 1).alias("avg_score"),
-    ).show()
-
-    # Show cameras that have alternative locations
-    cameras_with_alternatives = (
-        silver
-        .filter(F.col("alternative_locations") != "")
-        .select("camera_id")
-        .distinct()
-        .count()
-    )
-    print(f"  Cameras with alternative locations flagged: {cameras_with_alternatives}")
-
-    # ── Write Silver ────────────────────────────────────────────────────
-    silver.write.mode("overwrite").parquet(
-        f"{config.SILVER_PATH}/run_date={run_date.strftime('%Y-%m-%d')}"
-    )
-
-    # ── Merge to Gold ───────────────────────────────────────────────────
-    print("  [GOLD] Merging...")
-    merge_to_gold(silver, spark, config)
-
-    print(f"\n{'='*70}")
-    print(f"  Pipeline complete.")
-    print(f"{'='*70}\n")
-    spark.stop()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--date", type=str, default=datetime.now().strftime("%Y-%m-%d"))
-    args = parser.parse_args()
-    run_pipeline(datetime.strptime(args.date, "%Y-%m-%d"))
+// ============================================================================
+// DYNAMIC FORM COMPONENT — Angular 17 / Nx Library Compatible
+// ============================================================================
+//
+// CONTRAINTES :
+//   ✅ Angular 17 (pas de @let, pas de Signal Forms, pas de signal inputs)
+//   ✅ Reactive Forms (FormGroup, FormControl, FormArray)
+//   ✅ Standalone component (importable sans NgModule)
+//   ✅ Signals (signal, computed, effect) pour le DependencyEngine
+//   ✅ Nouveau control flow (@if, @for) — disponible Angular 17
+//   ✅ Buildable en tant que librairie Nx
+//   ✅ Importable dans un projet Angular 17 externe
+//   ✅ OnPush change detection
+//   ✅ Pas de dépendances tierces
+//
+// ARCHITECTURE :
+//   FormConfig (JSON)
+//     ├── DynamicFormComponent     → Orchestre rendu + réactivité
+//     ├── DependencyEngine         → Évalue les dépendances via computed()
+//     └── FormBuilderService       → Construit le FormGroup depuis la config
+//
+// EXPORTS depuis le public-api de la lib Nx :
+//   export * from './lib/dynamic-form/dynamic-form.component';
+//   export * from './lib/dynamic-form/models';
+//   export * from './lib/dynamic-form/dependency-engine';
+//   export * from './lib/dynamic-form/form-builder.service';
+//
+// ============================================================================
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FICHIER 1 : models.ts — Interfaces & Types
+// ═══════════════════════════════════════════════════════════════════════════
+
+// --- Copier dans : libs/<your-lib>/src/lib/dynamic-form/models.ts ---
+
+export type ControlType =
+  | 'text'
+  | 'number'
+  | 'email'
+  | 'password'
+  | 'textarea'
+  | 'select'
+  | 'radio'
+  | 'checkbox'
+  | 'date'
+  | 'time'
+  | 'toggle'
+  | 'slider'
+  | 'file'
+  | 'hidden'
+  | 'group'
+  | 'array'
+  | 'custom';
+
+export type DependencyOperator =
+  | 'equals'
+  | 'notEquals'
+  | 'contains'
+  | 'notContains'
+  | 'greaterThan'
+  | 'lessThan'
+  | 'in'
+  | 'notIn'
+  | 'isEmpty'
+  | 'isNotEmpty'
+  | 'matches'
+  | 'custom';
+
+export type ConditionLogic = 'AND' | 'OR';
+
+export interface SelectOption {
+  label: string;
+  value: any;
+  disabled?: boolean;
+  group?: string;
+  icon?: string;
+  description?: string;
+}
+
+export interface DependencyCondition {
+  field: string;
+  operator: DependencyOperator;
+  value?: any;
+  customFn?: (fieldValue: any, formValues: Record<string, any>) => boolean;
+}
+
+export interface DependencyEffect {
+  visible?: boolean;
+  disabled?: boolean;
+  required?: boolean;
+  readonly?: boolean;
+  placeholder?: string;
+  label?: string;
+  options?: SelectOption[] | ((formValues: Record<string, any>) => SelectOption[]);
+  optionsLoader?: (formValues: Record<string, any>) => Promise<SelectOption[]>;
+  setValue?: any | ((formValues: Record<string, any>) => any);
+  resetValue?: boolean;
+  helpText?: string;
+  cssClass?: string;
+  min?: number | string;
+  max?: number | string;
+  pattern?: string;
+  validators?: ValidatorConfig[];
+}
+
+export interface DependencyRule {
+  id?: string;
+  conditions: DependencyCondition[];
+  logic?: ConditionLogic;
+  effects: DependencyEffect;
+  elseEffects?: DependencyEffect;
+}
+
+export interface ValidatorConfig {
+  type: 'required' | 'min' | 'max' | 'minLength' | 'maxLength'
+      | 'pattern' | 'email' | 'custom';
+  value?: any;
+  message: string;
+  customFn?: (value: any, formValues: Record<string, any>) => boolean;
+}
+
+export interface LayoutConfig {
+  colSpan?: number;
+  wrapperClass?: string;
+  order?: number;
+  separator?: boolean;
+  sectionTitle?: string;
+  sectionDescription?: string;
+}
+
+export interface FieldRuntimeState {
+  visible: boolean;
+  disabled: boolean;
+  required: boolean;
+  readonly: boolean;
+  placeholder: string;
+  label: string;
+  options: SelectOption[];
+  helpText: string;
+  cssClass: string;
+  loading: boolean;
+  min?: number | string;
+  max?: number | string;
+}
+
+export interface FieldConfig {
+  key: string;
+  type: ControlType;
+  label?: string;
+  placeholder?: string;
+  defaultValue?: any;
+  tooltip?: string;
+  helpText?: string;
+  prefix?: string;
+  suffix?: string;
+  disabled?: boolean;
+  hidden?: boolean;
+  readonly?: boolean;
+
+  options?: SelectOption[];
+  optionsLoader?: (formValues: Record<string, any>) => Promise<SelectOption[]>;
+
+  validators?: ValidatorConfig[];
+  dependencies?: DependencyRule[];
+  layout?: LayoutConfig;
+
+  children?: FieldConfig[];
+  arrayConfig?: {
+    itemFields: FieldConfig[];
+    minItems?: number;
+    maxItems?: number;
+    addLabel?: string;
+    removeLabel?: string;
+  };
+
+  customTemplateRef?: string;
+  cssClass?: string;
+  attributes?: Record<string, string>;
+
+  onChange?: (value: any, formValues: Record<string, any>) => void;
+  onFocus?: (formValues: Record<string, any>) => void;
+  onBlur?: (value: any, formValues: Record<string, any>) => void;
+}
+
+export interface FormConfig {
+  id?: string;
+  title?: string;
+  description?: string;
+  fields: FieldConfig[];
+  layout?: {
+    columns?: number;
+    labelPosition?: 'top' | 'left' | 'floating';
+    size?: 'sm' | 'md' | 'lg';
+  };
+  submitLabel?: string;
+  showReset?: boolean;
+  resetLabel?: string;
+  disableSubmitIfInvalid?: boolean;
+  cssClass?: string;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FICHIER 2 : dependency-engine.ts — Moteur de dépendances (Signals)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// --- Copier dans : libs/<your-lib>/src/lib/dynamic-form/dependency-engine.ts ---
+
+import { Injectable, signal, computed, type Signal, type WritableSignal } from '@angular/core';
+import type {
+  FieldConfig, FieldRuntimeState, DependencyCondition,
+  DependencyRule, DependencyEffect, SelectOption,
+} from './models';
+import type { FormGroup, AbstractControl } from '@angular/forms';
+import { Validators, type ValidatorFn, type ValidationErrors } from '@angular/forms';
+
+@Injectable()
+export class DependencyEngine {
+
+  // ── Évaluation des conditions ──
+
+  evaluateCondition(condition: DependencyCondition, formValues: Record<string, any>): boolean {
+    const fieldValue = this.getNestedValue(formValues, condition.field);
+
+    switch (condition.operator) {
+      case 'equals':        return fieldValue === condition.value;
+      case 'notEquals':     return fieldValue !== condition.value;
+      case 'contains':
+        if (Array.isArray(fieldValue)) return fieldValue.includes(condition.value);
+        if (typeof fieldValue === 'string') return fieldValue.includes(condition.value);
+        return false;
+      case 'notContains':
+        if (Array.isArray(fieldValue)) return !fieldValue.includes(condition.value);
+        if (typeof fieldValue === 'string') return !fieldValue.includes(condition.value);
+        return true;
+      case 'greaterThan':   return fieldValue > condition.value;
+      case 'lessThan':      return fieldValue < condition.value;
+      case 'in':            return Array.isArray(condition.value) && condition.value.includes(fieldValue);
+      case 'notIn':         return Array.isArray(condition.value) && !condition.value.includes(fieldValue);
+      case 'isEmpty':
+        return fieldValue == null || fieldValue === '' ||
+               (Array.isArray(fieldValue) && fieldValue.length === 0);
+      case 'isNotEmpty':
+        return fieldValue != null && fieldValue !== '' &&
+               !(Array.isArray(fieldValue) && fieldValue.length === 0);
+      case 'matches':
+        return typeof fieldValue === 'string' && new RegExp(condition.value).test(fieldValue);
+      case 'custom':
+        return condition.customFn ? condition.customFn(fieldValue, formValues) : false;
+      default: return false;
+    }
+  }
+
+  evaluateRule(rule: DependencyRule, formValues: Record<string, any>): boolean {
+    const logic = rule.logic || 'AND';
+    return logic === 'AND'
+      ? rule.conditions.every(c => this.evaluateCondition(c, formValues))
+      : rule.conditions.some(c => this.evaluateCondition(c, formValues));
+  }
+
+  // ── Calcul de l'état runtime ──
+
+  computeFieldState(field: FieldConfig, formValues: Record<string, any>): FieldRuntimeState {
+    const state: FieldRuntimeState = {
+      visible: !field.hidden,
+      disabled: field.disabled || false,
+      required: field.validators?.some(v => v.type === 'required') || false,
+      readonly: field.readonly || false,
+      placeholder: field.placeholder || '',
+      label: field.label || '',
+      options: field.options ? [...field.options] : [],
+      helpText: field.helpText || '',
+      cssClass: field.cssClass || '',
+      loading: false,
+      min: undefined,
+      max: undefined,
+    };
+
+    if (field.dependencies) {
+      for (const rule of field.dependencies) {
+        const met = this.evaluateRule(rule, formValues);
+        const effects = met ? rule.effects : rule.elseEffects;
+        if (effects) {
+          this.mergeEffects(state, effects, formValues);
+        }
+      }
+    }
+
+    return state;
+  }
+
+  private mergeEffects(
+    state: FieldRuntimeState,
+    effects: DependencyEffect,
+    formValues: Record<string, any>
+  ): void {
+    if (effects.visible !== undefined) state.visible = effects.visible;
+    if (effects.disabled !== undefined) state.disabled = effects.disabled;
+    if (effects.required !== undefined) state.required = effects.required;
+    if (effects.readonly !== undefined) state.readonly = effects.readonly;
+    if (effects.placeholder !== undefined) state.placeholder = effects.placeholder;
+    if (effects.label !== undefined) state.label = effects.label;
+    if (effects.helpText !== undefined) state.helpText = effects.helpText;
+    if (effects.cssClass !== undefined) state.cssClass = effects.cssClass;
+    if (effects.min !== undefined) state.min = effects.min;
+    if (effects.max !== undefined) state.max = effects.max;
+
+    if (effects.options !== undefined) {
+      state.options = typeof effects.options === 'function'
+        ? effects.options(formValues)
+        : effects.options;
+    }
+  }
+
+  // ── Application des effets sur le FormGroup ──
+
+  applyControlEffects(
+    field: FieldConfig,
+    state: FieldRuntimeState,
+    formGroup: FormGroup,
+    formValues: Record<string, any>,
+    previousState?: FieldRuntimeState
+  ): void {
+    const control = this.getControl(formGroup, field.key);
+    if (!control) return;
+
+    // Disabled / Enabled
+    if (!previousState || previousState.disabled !== state.disabled) {
+      if (state.disabled && !control.disabled) {
+        control.disable({ emitEvent: false });
+      } else if (!state.disabled && control.disabled) {
+        control.enable({ emitEvent: false });
+      }
+    }
+
+    // Validators dynamiques
+    if (!previousState || previousState.required !== state.required) {
+      const validators = this.buildValidators(field, state);
+      control.setValidators(validators);
+      control.updateValueAndValidity({ emitEvent: false });
+    }
+  }
+
+  applySideEffects(
+    field: FieldConfig,
+    formGroup: FormGroup,
+    formValues: Record<string, any>
+  ): void {
+    if (!field.dependencies) return;
+
+    for (const rule of field.dependencies) {
+      const met = this.evaluateRule(rule, formValues);
+      const effects = met ? rule.effects : rule.elseEffects;
+      if (!effects) continue;
+
+      const control = this.getControl(formGroup, field.key);
+      if (!control) continue;
+
+      // setValue
+      if (effects.setValue !== undefined) {
+        const newVal = typeof effects.setValue === 'function'
+          ? effects.setValue(formValues)
+          : effects.setValue;
+        if (control.value !== newVal) {
+          control.setValue(newVal, { emitEvent: false });
+        }
+      }
+
+      // resetValue
+      if (effects.resetValue) {
+        const defaultVal = field.defaultValue ?? null;
+        if (control.value !== defaultVal) {
+          control.reset(defaultVal, { emitEvent: false });
+        }
+      }
+    }
+  }
+
+  // ── Validators ──
+
+  buildValidators(field: FieldConfig, state?: FieldRuntimeState): ValidatorFn[] {
+    const validators: ValidatorFn[] = [];
+
+    if (state?.required) {
+      validators.push(Validators.required);
+    }
+
+    if (field.validators) {
+      for (const v of field.validators) {
+        switch (v.type) {
+          case 'required':
+            if (!state?.required) validators.push(Validators.required);
+            break;
+          case 'min':       validators.push(Validators.min(v.value)); break;
+          case 'max':       validators.push(Validators.max(v.value)); break;
+          case 'minLength': validators.push(Validators.minLength(v.value)); break;
+          case 'maxLength': validators.push(Validators.maxLength(v.value)); break;
+          case 'pattern':   validators.push(Validators.pattern(v.value)); break;
+          case 'email':     validators.push(Validators.email); break;
+          case 'custom':
+            if (v.customFn) {
+              const fn = v.customFn;
+              const msg = v.message;
+              validators.push((ctrl: AbstractControl): ValidationErrors | null => {
+                const formValues = ctrl.parent ? (ctrl.parent as FormGroup).getRawValue() : {};
+                return fn(ctrl.value, formValues) ? null : { custom: msg };
+              });
+            }
+            break;
+        }
+      }
+    }
+
+    return validators;
+  }
+
+  getErrorMessage(field: FieldConfig, control: AbstractControl): string | null {
+    if (!control.errors || !control.touched) return null;
+
+    if (control.errors['required']) {
+      return field.validators?.find(v => v.type === 'required')?.message
+        || `${field.label || field.key} est requis`;
+    }
+    if (control.errors['min']) {
+      return field.validators?.find(v => v.type === 'min')?.message
+        || `Valeur minimum : ${control.errors['min'].min}`;
+    }
+    if (control.errors['max']) {
+      return field.validators?.find(v => v.type === 'max')?.message
+        || `Valeur maximum : ${control.errors['max'].max}`;
+    }
+    if (control.errors['minlength']) {
+      return field.validators?.find(v => v.type === 'minLength')?.message
+        || `Minimum ${control.errors['minlength'].requiredLength} caractères`;
+    }
+    if (control.errors['maxlength']) {
+      return field.validators?.find(v => v.type === 'maxLength')?.message
+        || `Maximum ${control.errors['maxlength'].requiredLength} caractères`;
+    }
+    if (control.errors['email']) {
+      return field.validators?.find(v => v.type === 'email')?.message || 'Email invalide';
+    }
+    if (control.errors['pattern']) {
+      return field.validators?.find(v => v.type === 'pattern')?.message || 'Format invalide';
+    }
+    if (control.errors['custom']) {
+      return control.errors['custom'];
+    }
+    return 'Valeur invalide';
+  }
+
+  // ── Utilitaires ──
+
+  getNestedValue(obj: any, path: string): any {
+    return path.split('.').reduce((acc, key) => acc?.[key], obj);
+  }
+
+  private getControl(formGroup: FormGroup, key: string): AbstractControl | null {
+    const parts = key.split('.');
+    let control: AbstractControl | null = formGroup;
+    for (const part of parts) {
+      control = (control as FormGroup).get(part);
+      if (!control) return null;
+    }
+    return control;
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FICHIER 3 : form-builder.service.ts
+// ═══════════════════════════════════════════════════════════════════════════
+
+// --- Copier dans : libs/<your-lib>/src/lib/dynamic-form/form-builder.service.ts ---
+
+import { Injectable, inject } from '@angular/core';
+import {
+  FormBuilder, FormGroup, FormControl, FormArray,
+  type AbstractControl,
+} from '@angular/forms';
+import type { FieldConfig, ControlType } from './models';
+// import { DependencyEngine } from './dependency-engine';
+
+// Note : DependencyEngine est injecté dans le composant parent,
+// on le passe en paramètre ici pour éviter les problèmes de DI
+// dans un contexte de librairie Nx.
+
+@Injectable()
+export class DynamicFormBuilderService {
+
+  private fb = inject(FormBuilder);
+
+  buildForm(fields: FieldConfig[], engine: DependencyEngine): FormGroup {
+    const group: Record<string, AbstractControl> = {};
+
+    for (const field of fields) {
+      if (field.type === 'group' && field.children) {
+        group[field.key] = this.buildForm(field.children, engine);
+      } else if (field.type === 'array' && field.arrayConfig) {
+        const initialItems = Array.isArray(field.defaultValue) ? field.defaultValue : [];
+        const formArray = this.fb.array(
+          initialItems.map(() => this.buildForm(field.arrayConfig!.itemFields, engine))
+        );
+        group[field.key] = formArray;
+      } else {
+        const validators = engine.buildValidators(field);
+        const control = new FormControl(
+          { value: field.defaultValue ?? this.getDefaultForType(field.type), disabled: field.disabled || false },
+          validators
+        );
+        group[field.key] = control;
+      }
+    }
+
+    return this.fb.group(group);
+  }
+
+  addArrayItem(formArray: FormArray, itemFields: FieldConfig[], engine: DependencyEngine): void {
+    formArray.push(this.buildForm(itemFields, engine));
+  }
+
+  removeArrayItem(formArray: FormArray, index: number): void {
+    formArray.removeAt(index);
+  }
+
+  private getDefaultForType(type: ControlType): any {
+    switch (type) {
+      case 'checkbox': case 'toggle': return false;
+      case 'number': case 'slider': return 0;
+      default: return '';
+    }
+  }
+}
+
+// Type re-export pour l'injection (on importe DependencyEngine ici
+// pour le type signature, le vrai fichier TS importera normalement)
+import { DependencyEngine } from './dependency-engine';
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FICHIER 4 : dynamic-form.component.ts — Le composant principal
+// ═══════════════════════════════════════════════════════════════════════════
+
+// --- Copier dans : libs/<your-lib>/src/lib/dynamic-form/dynamic-form.component.ts ---
+
+import {
+  Component, Input, Output, EventEmitter,
+  OnInit, OnDestroy, OnChanges, SimpleChanges,
+  ChangeDetectionStrategy, ChangeDetectorRef,
+  TemplateRef, ContentChildren, QueryList,
+  Directive, inject, signal, computed, effect,
+  DestroyRef,
+} from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { ReactiveFormsModule, FormGroup, FormControl, FormArray, AbstractControl } from '@angular/forms';
+import { Subscription, startWith, debounceTime } from 'rxjs';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+
+// import { DependencyEngine } from './dependency-engine';
+// import { DynamicFormBuilderService } from './form-builder.service';
+// import type { FormConfig, FieldConfig, ControlType, FieldRuntimeState, SelectOption } from './models';
+
+// ── Directive pour les templates custom ──
+
+@Directive({
+  selector: '[dynamicFieldTemplate]',
+  standalone: true,
+})
+export class DynamicFieldTemplateDirective {
+  @Input('dynamicFieldTemplate') name!: string;
+  constructor(public templateRef: TemplateRef<any>) {}
+}
+
+
+// ── Composant principal ──
+
+@Component({
+  selector: 'lib-dynamic-form',
+  standalone: true,
+  imports: [CommonModule, ReactiveFormsModule],
+  providers: [DependencyEngine, DynamicFormBuilderService],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  // ⚠️ ANGULAR 17 : pas de @let, pas de @for...track $index natif
+  // On utilise @if / @for (nouveau control flow dispo depuis Angular 17)
+  // Mais on NE peut PAS utiliser @let (Angular 18.1+)
+  template: `
+    @if (formGroup) {
+      <form
+        [formGroup]="formGroup"
+        [class]="config.cssClass ?? ''"
+        [ngClass]="{
+          'df': true,
+          'df--sm': config.layout?.size === 'sm',
+          'df--lg': config.layout?.size === 'lg',
+          'df--label-left': config.layout?.labelPosition === 'left'
+        }"
+        (ngSubmit)="onSubmit()"
+      >
+        <!-- Header -->
+        @if (config.title || config.description) {
+          <div class="df__header">
+            @if (config.title) { <h2 class="df__title">{{ config.title }}</h2> }
+            @if (config.description) { <p class="df__desc">{{ config.description }}</p> }
+          </div>
+        }
+
+        <!-- Grille -->
+        <div class="df__grid" [style.--df-cols]="config.layout?.columns ?? 1">
+          @for (field of config.fields; track field.key) {
+            <ng-container
+              [ngTemplateOutlet]="fieldTpl"
+              [ngTemplateOutletContext]="{ $implicit: field, fg: formGroup, parentPath: '' }"
+            ></ng-container>
+          }
+        </div>
+
+        <!-- Actions -->
+        <div class="df__actions">
+          @if (config.showReset) {
+            <button type="button" class="df__btn df__btn--reset" (click)="onReset()">
+              {{ config.resetLabel ?? 'Réinitialiser' }}
+            </button>
+          }
+          <button
+            type="submit"
+            class="df__btn df__btn--submit"
+            [disabled]="config.disableSubmitIfInvalid && formGroup.invalid"
+          >
+            {{ config.submitLabel ?? 'Soumettre' }}
+          </button>
+        </div>
+      </form>
+    }
+
+    <!-- ═══ Template récursif pour chaque champ ═══ -->
+    <ng-template #fieldTpl let-field let-fg="fg" let-parentPath="parentPath">
+      <!-- On récupère l'état runtime depuis le cache signal -->
+      @if (getRuntimeState(field).visible) {
+        <!-- Séparateur -->
+        @if (field.layout?.separator) {
+          <div class="df__separator" style="grid-column: 1 / -1"></div>
+        }
+
+        <!-- Section title -->
+        @if (field.layout?.sectionTitle) {
+          <div class="df__section" style="grid-column: 1 / -1">
+            <h3 class="df__section-title">{{ field.layout.sectionTitle }}</h3>
+            @if (field.layout.sectionDescription) {
+              <p class="df__section-desc">{{ field.layout.sectionDescription }}</p>
+            }
+          </div>
+        }
+
+        <!-- Field wrapper -->
+        <div
+          class="df__field"
+          [ngClass]="[
+            'df__field--' + field.type,
+            getRuntimeState(field).cssClass
+          ]"
+          [class.df__field--error]="getCtrl(fg, field.key)?.invalid && getCtrl(fg, field.key)?.touched"
+          [class.df__field--disabled]="getRuntimeState(field).disabled"
+          [style.grid-column]="'span ' + (field.layout?.colSpan ?? 1)"
+          [style.order]="field.layout?.order ?? null"
+        >
+          <!-- LABEL -->
+          @if (field.type !== 'hidden' && field.type !== 'checkbox' && field.type !== 'toggle') {
+            <label class="df__label" [attr.for]="fieldId(field, parentPath)">
+              {{ getRuntimeState(field).label || field.label }}
+              @if (getRuntimeState(field).required) { <span class="df__req">*</span> }
+              @if (field.tooltip) { <span class="df__tip" [title]="field.tooltip">ⓘ</span> }
+            </label>
+          }
+
+          <!-- ═══ TEXT / NUMBER / EMAIL / PASSWORD ═══ -->
+          @if (isTextInput(field.type)) {
+            <div class="df__input-wrap">
+              @if (field.prefix) { <span class="df__prefix">{{ field.prefix }}</span> }
+              <input
+                [id]="fieldId(field, parentPath)"
+                [type]="inputType(field.type)"
+                [formControl]="asFormControl(fg, field.key)"
+                [placeholder]="getRuntimeState(field).placeholder"
+                [attr.min]="getRuntimeState(field).min"
+                [attr.max]="getRuntimeState(field).max"
+                [readonly]="getRuntimeState(field).readonly"
+                class="df__input"
+              />
+              @if (field.suffix) { <span class="df__suffix">{{ field.suffix }}</span> }
+            </div>
+          }
+
+          <!-- ═══ TEXTAREA ═══ -->
+          @if (field.type === 'textarea') {
+            <textarea
+              [id]="fieldId(field, parentPath)"
+              [formControl]="asFormControl(fg, field.key)"
+              [placeholder]="getRuntimeState(field).placeholder"
+              [readonly]="getRuntimeState(field).readonly"
+              class="df__textarea"
+              rows="4"
+            ></textarea>
+          }
+
+          <!-- ═══ SELECT ═══ -->
+          @if (field.type === 'select') {
+            <div class="df__select-wrap">
+              <select
+                [id]="fieldId(field, parentPath)"
+                [formControl]="asFormControl(fg, field.key)"
+                class="df__select"
+              >
+                @if (getRuntimeState(field).placeholder) {
+                  <option value="" disabled>{{ getRuntimeState(field).placeholder }}</option>
+                }
+                @for (opt of getRuntimeState(field).options; track opt.value) {
+                  <option [value]="opt.value" [disabled]="opt.disabled ?? false">{{ opt.label }}</option>
+                }
+              </select>
+              @if (getRuntimeState(field).loading) {
+                <span class="df__spinner"></span>
+              }
+            </div>
+          }
+
+          <!-- ═══ RADIO ═══ -->
+          @if (field.type === 'radio') {
+            <div class="df__radio-group">
+              @for (opt of getRuntimeState(field).options; track opt.value) {
+                <label class="df__radio-item">
+                  <input type="radio" [formControl]="asFormControl(fg, field.key)"
+                         [value]="opt.value" class="df__radio-input" />
+                  <span class="df__radio-label">{{ opt.label }}</span>
+                </label>
+              }
+            </div>
+          }
+
+          <!-- ═══ CHECKBOX ═══ -->
+          @if (field.type === 'checkbox') {
+            <label class="df__checkbox-item">
+              <input [id]="fieldId(field, parentPath)" type="checkbox"
+                     [formControl]="asFormControl(fg, field.key)" class="df__checkbox-input" />
+              <span class="df__checkbox-label">
+                {{ getRuntimeState(field).label || field.label }}
+                @if (getRuntimeState(field).required) { <span class="df__req">*</span> }
+              </span>
+            </label>
+          }
+
+          <!-- ═══ TOGGLE ═══ -->
+          @if (field.type === 'toggle') {
+            <label class="df__toggle-item">
+              <input [id]="fieldId(field, parentPath)" type="checkbox"
+                     [formControl]="asFormControl(fg, field.key)" class="df__toggle-input" />
+              <span class="df__toggle-slider"></span>
+              <span class="df__toggle-label">{{ getRuntimeState(field).label || field.label }}</span>
+            </label>
+          }
+
+          <!-- ═══ DATE / TIME ═══ -->
+          @if (field.type === 'date' || field.type === 'time') {
+            <input
+              [id]="fieldId(field, parentPath)"
+              [type]="field.type"
+              [formControl]="asFormControl(fg, field.key)"
+              [attr.min]="getRuntimeState(field).min"
+              [attr.max]="getRuntimeState(field).max"
+              class="df__input"
+            />
+          }
+
+          <!-- ═══ SLIDER ═══ -->
+          @if (field.type === 'slider') {
+            <div class="df__slider-wrap">
+              <input [id]="fieldId(field, parentPath)" type="range"
+                     [formControl]="asFormControl(fg, field.key)"
+                     [attr.min]="getRuntimeState(field).min ?? 0"
+                     [attr.max]="getRuntimeState(field).max ?? 100"
+                     class="df__slider" />
+              <span class="df__slider-val">{{ getCtrl(fg, field.key)?.value }}</span>
+            </div>
+          }
+
+          <!-- ═══ HIDDEN ═══ -->
+          @if (field.type === 'hidden') {
+            <input type="hidden" [formControl]="asFormControl(fg, field.key)" />
+          }
+
+          <!-- ═══ GROUP ═══ -->
+          @if (field.type === 'group' && field.children) {
+            <div class="df__group" [formGroupName]="field.key">
+              <div class="df__grid" [style.--df-cols]="config.layout?.columns ?? 1">
+                @for (child of field.children; track child.key) {
+                  <ng-container
+                    [ngTemplateOutlet]="fieldTpl"
+                    [ngTemplateOutletContext]="{
+                      $implicit: child,
+                      fg: asFormGroup(fg, field.key),
+                      parentPath: joinPath(parentPath, field.key)
+                    }"
+                  ></ng-container>
+                }
+              </div>
+            </div>
+          }
+
+          <!-- ═══ ARRAY ═══ -->
+          @if (field.type === 'array' && field.arrayConfig) {
+            <div class="df__array" [formArrayName]="field.key">
+              @for (item of asFormArray(fg, field.key).controls; track $index) {
+                <div class="df__array-item" [formGroupName]="$index">
+                  <div class="df__grid" [style.--df-cols]="config.layout?.columns ?? 1">
+                    @for (child of field.arrayConfig.itemFields; track child.key) {
+                      <ng-container
+                        [ngTemplateOutlet]="fieldTpl"
+                        [ngTemplateOutletContext]="{
+                          $implicit: child,
+                          fg: asFormGroupAt(fg, field.key, $index),
+                          parentPath: joinPath(parentPath, field.key, '' + $index)
+                        }"
+                      ></ng-container>
+                    }
+                  </div>
+                  @if (!field.arrayConfig.minItems || asFormArray(fg, field.key).length > (field.arrayConfig.minItems ?? 0)) {
+                    <button type="button" class="df__btn df__btn--remove"
+                            (click)="removeArrayItem(fg, field, $index)">
+                      {{ field.arrayConfig.removeLabel ?? '✕ Supprimer' }}
+                    </button>
+                  }
+                </div>
+              }
+              @if (!field.arrayConfig.maxItems || asFormArray(fg, field.key).length < (field.arrayConfig.maxItems ?? 999)) {
+                <button type="button" class="df__btn df__btn--add"
+                        (click)="addArrayItem(fg, field)">
+                  {{ field.arrayConfig.addLabel ?? '+ Ajouter' }}
+                </button>
+              }
+            </div>
+          }
+
+          <!-- ═══ CUSTOM TEMPLATE ═══ -->
+          @if (field.type === 'custom' && field.customTemplateRef) {
+            @for (tpl of customTemplates; track tpl.name) {
+              @if (tpl.name === field.customTemplateRef) {
+                <ng-container
+                  [ngTemplateOutlet]="tpl.templateRef"
+                  [ngTemplateOutletContext]="{
+                    $implicit: field,
+                    control: getCtrl(fg, field.key),
+                    formGroup: fg,
+                    formValues: fg.getRawValue()
+                  }"
+                ></ng-container>
+              }
+            }
+          }
+
+          <!-- Help text -->
+          @if (getRuntimeState(field).helpText && field.type !== 'hidden') {
+            <small class="df__help">{{ getRuntimeState(field).helpText }}</small>
+          }
+
+          <!-- Error -->
+          @if (getCtrl(fg, field.key)?.invalid && getCtrl(fg, field.key)?.touched && field.type !== 'hidden') {
+            <small class="df__error">{{ getError(field, fg) }}</small>
+          }
+        </div>
+      }
+    </ng-template>
+  `,
+  styles: [`
+    :host {
+      --df-primary: #4f46e5;
+      --df-primary-h: #4338ca;
+      --df-danger: #ef4444;
+      --df-bg: #fff;
+      --df-surface: #f8fafc;
+      --df-border: #e2e8f0;
+      --df-text: #1e293b;
+      --df-muted: #64748b;
+      --df-placeholder: #94a3b8;
+      --df-radius: 8px;
+      --df-gap: 1rem;
+      --df-font: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      --df-tr: 200ms cubic-bezier(.4,0,.2,1);
+      display: block; font-family: var(--df-font); color: var(--df-text);
+    }
+    .df__header { margin-bottom: calc(var(--df-gap)*1.5); }
+    .df__title { font-size: 1.5rem; font-weight: 700; margin: 0 0 .25rem; }
+    .df__desc { font-size: .875rem; color: var(--df-muted); margin: 0; }
+    .df__grid { display: grid; grid-template-columns: repeat(var(--df-cols,1),1fr); gap: var(--df-gap); align-items: start; }
+    .df__field { display: flex; flex-direction: column; gap: .375rem; }
+    .df__label { font-size: .875rem; font-weight: 600; display: flex; align-items: center; gap: .25rem; }
+    .df__req { color: var(--df-danger); font-weight: 700; }
+    .df__tip { cursor: help; opacity: .5; font-size: .75rem; }
+    .df--label-left .df__field { flex-direction: row; align-items: center; gap: var(--df-gap); }
+    .df--label-left .df__label { min-width: 150px; flex-shrink: 0; }
+    .df__input,.df__textarea,.df__select {
+      width: 100%; padding: .625rem .875rem; font-size: .875rem; font-family: inherit;
+      color: var(--df-text); background: var(--df-bg); border: 1.5px solid var(--df-border);
+      border-radius: var(--df-radius); transition: border-color var(--df-tr), box-shadow var(--df-tr);
+      outline: none; box-sizing: border-box;
+    }
+    .df__input:focus,.df__textarea:focus,.df__select:focus {
+      border-color: var(--df-primary); box-shadow: 0 0 0 3px rgba(79,70,229,.1);
+    }
+    .df__input::placeholder,.df__textarea::placeholder { color: var(--df-placeholder); }
+    .df__input:disabled,.df__textarea:disabled,.df__select:disabled {
+      opacity: .6; cursor: not-allowed; background: var(--df-surface);
+    }
+    .df__input:read-only { background: var(--df-surface); }
+    .df__field--error .df__input,.df__field--error .df__textarea,.df__field--error .df__select {
+      border-color: var(--df-danger);
+    }
+    .df__input-wrap { display: flex; align-items: center; }
+    .df__input-wrap .df__input { flex: 1; }
+    .df__prefix,.df__suffix {
+      padding: .625rem .75rem; font-size: .875rem; color: var(--df-muted);
+      background: var(--df-surface); border: 1.5px solid var(--df-border); white-space: nowrap;
+    }
+    .df__prefix { border-right: none; border-radius: var(--df-radius) 0 0 var(--df-radius); }
+    .df__prefix+.df__input { border-radius: 0 var(--df-radius) var(--df-radius) 0; }
+    .df__suffix { border-left: none; border-radius: 0 var(--df-radius) var(--df-radius) 0; }
+    .df__select-wrap { position: relative; }
+    .df__select {
+      appearance: none; padding-right: 2.5rem; cursor: pointer;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%2364748b' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+      background-repeat: no-repeat; background-position: right .75rem center;
+    }
+    .df__spinner {
+      position: absolute; right: 2.5rem; top: 50%; transform: translateY(-50%);
+      width: 16px; height: 16px; border: 2px solid var(--df-border); border-top-color: var(--df-primary);
+      border-radius: 50%; animation: df-spin 1s linear infinite;
+    }
+    @keyframes df-spin { to { transform: translateY(-50%) rotate(360deg); } }
+    .df__radio-group { display: flex; flex-wrap: wrap; gap: .75rem; }
+    .df__radio-item { display: flex; align-items: center; gap: .5rem; cursor: pointer; font-size: .875rem; }
+    .df__radio-input { accent-color: var(--df-primary); width: 1rem; height: 1rem; }
+    .df__checkbox-item { display: flex; align-items: center; gap: .5rem; cursor: pointer; font-size: .875rem; }
+    .df__checkbox-input { accent-color: var(--df-primary); width: 1.125rem; height: 1.125rem; }
+    .df__toggle-item { display: flex; align-items: center; gap: .75rem; cursor: pointer; font-size: .875rem; }
+    .df__toggle-input { display: none; }
+    .df__toggle-slider {
+      width: 44px; height: 24px; background: var(--df-border); border-radius: 12px;
+      position: relative; transition: background var(--df-tr); flex-shrink: 0;
+    }
+    .df__toggle-slider::after {
+      content: ''; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px;
+      background: #fff; border-radius: 50%; transition: transform var(--df-tr);
+      box-shadow: 0 1px 3px rgba(0,0,0,.2);
+    }
+    .df__toggle-input:checked+.df__toggle-slider { background: var(--df-primary); }
+    .df__toggle-input:checked+.df__toggle-slider::after { transform: translateX(20px); }
+    .df__slider-wrap { display: flex; align-items: center; gap: .75rem; }
+    .df__slider { flex: 1; accent-color: var(--df-primary); height: 6px; }
+    .df__slider-val { font-size: .875rem; font-weight: 600; min-width: 2rem; text-align: right; }
+    .df__group,.df__array-item {
+      border: 1.5px solid var(--df-border); border-radius: var(--df-radius);
+      padding: var(--df-gap); background: var(--df-surface);
+    }
+    .df__array-item { margin-bottom: .75rem; }
+    .df__help { font-size: .75rem; color: var(--df-muted); }
+    .df__error { font-size: .75rem; color: var(--df-danger); font-weight: 500; }
+    .df__separator { border-top: 1px solid var(--df-border); margin: .5rem 0; }
+    .df__section { margin: .5rem 0 0; }
+    .df__section-title { font-size: 1.125rem; font-weight: 700; margin: 0 0 .125rem; }
+    .df__section-desc { font-size: .8125rem; color: var(--df-muted); margin: 0; }
+    .df__actions {
+      display: flex; justify-content: flex-end; gap: .75rem;
+      margin-top: calc(var(--df-gap)*1.5); padding-top: var(--df-gap);
+      border-top: 1px solid var(--df-border);
+    }
+    .df__btn {
+      padding: .625rem 1.5rem; font-size: .875rem; font-weight: 600; font-family: inherit;
+      border-radius: var(--df-radius); border: none; cursor: pointer; transition: all var(--df-tr);
+    }
+    .df__btn--submit { background: var(--df-primary); color: #fff; }
+    .df__btn--submit:hover:not(:disabled) { background: var(--df-primary-h); }
+    .df__btn--submit:disabled { opacity: .5; cursor: not-allowed; }
+    .df__btn--reset { background: transparent; color: var(--df-muted); border: 1.5px solid var(--df-border); }
+    .df__btn--reset:hover { background: var(--df-surface); }
+    .df__btn--add { background: transparent; color: var(--df-primary); border: 1.5px dashed var(--df-primary); width: 100%; padding: .5rem; }
+    .df__btn--add:hover { background: rgba(79,70,229,.05); }
+    .df__btn--remove { background: transparent; color: var(--df-danger); border: 1px solid var(--df-danger); padding: .375rem .75rem; font-size: .8125rem; margin-top: .5rem; align-self: flex-end; }
+    .df--sm .df__input,.df--sm .df__textarea,.df--sm .df__select { padding: .4375rem .625rem; font-size: .8125rem; }
+    .df--lg .df__input,.df--lg .df__textarea,.df--lg .df__select { padding: .8125rem 1rem; font-size: 1rem; }
+    @media(max-width:640px) {
+      .df__grid { grid-template-columns: 1fr !important; }
+      .df__field { grid-column: span 1 !important; }
+      .df--label-left .df__field { flex-direction: column; }
+    }
+  `],
+})
+export class DynamicFormComponent implements OnInit, OnDestroy, OnChanges {
+
+  // ⚠️ Angular 17 : @Input() classique, pas de signal inputs
+  @Input() config!: FormConfig;
+
+  @Output() formSubmit = new EventEmitter<Record<string, any>>();
+  @Output() formValueChange = new EventEmitter<Record<string, any>>();
+  @Output() formStatusChange = new EventEmitter<string>();
+
+  @ContentChildren(DynamicFieldTemplateDirective)
+  customTemplates!: QueryList<DynamicFieldTemplateDirective>;
+
+  formGroup!: FormGroup;
+
+  private engine = inject(DependencyEngine);
+  private formBuilder = inject(DynamicFormBuilderService);
+  private cdr = inject(ChangeDetectorRef);
+  private destroyRef = inject(DestroyRef);
+
+  // Signal interne pour stocker les valeurs du formulaire
+  // → Sert de source réactive pour les computed() du DependencyEngine
+  private formValues = signal<Record<string, any>>({});
+
+  // Cache des états runtime (computed signals, recalculés automatiquement)
+  private runtimeCache = new Map<string, ReturnType<typeof computed<FieldRuntimeState>>>();
+
+  // Cache des options async
+  private asyncOptionsCache = new Map<string, { options: ReturnType<typeof signal<SelectOption[]>>; loading: ReturnType<typeof signal<boolean>> }>();
+
+  // Pour stocker les states précédents (éviter les updates inutiles)
+  private previousStates = new Map<string, FieldRuntimeState>();
+
+  private valueChangeSub?: Subscription;
+
+  ngOnInit(): void {
+    this.buildForm();
+  }
+
+  ngOnChanges(changes: SimpleChanges): void {
+    if (changes['config'] && !changes['config'].firstChange) {
+      this.runtimeCache.clear();
+      this.asyncOptionsCache.clear();
+      this.previousStates.clear();
+      this.buildForm();
+    }
+  }
+
+  ngOnDestroy(): void {
+    this.valueChangeSub?.unsubscribe();
+  }
+
+  // ─── Construction du formulaire ───
+
+  private buildForm(): void {
+    this.valueChangeSub?.unsubscribe();
+
+    this.formGroup = this.formBuilder.buildForm(this.config.fields, this.engine);
+
+    // Initialiser les computed signals pour chaque champ
+    this.initRuntimeCache(this.config.fields);
+
+    // Charger les options async
+    this.initAsyncOptions(this.config.fields);
+
+    // Écouter valueChanges → mettre à jour le signal formValues
+    this.valueChangeSub = this.formGroup.valueChanges.pipe(
+      startWith(this.formGroup.getRawValue()),
+      debounceTime(30),
+    ).subscribe(() => {
+      const raw = this.formGroup.getRawValue();
+      this.formValues.set(raw);
+      this.formValueChange.emit(raw);
+
+      // Appliquer les effets de bord (disable/enable, setValue, resetValue)
+      this.applyAllEffects(this.config.fields, raw);
+      this.cdr.markForCheck();
+    });
+
+    // Status
+    this.formGroup.statusChanges.pipe(
+      takeUntilDestroyed(this.destroyRef),
+    ).subscribe(status => this.formStatusChange.emit(status));
+
+    // Process initial
+    const initial = this.formGroup.getRawValue();
+    this.formValues.set(initial);
+    this.applyAllEffects(this.config.fields, initial);
+  }
+
+  private initRuntimeCache(fields: FieldConfig[], parentPath = ''): void {
+    for (const field of fields) {
+      const key = parentPath ? `${parentPath}.${field.key}` : field.key;
+
+      // Computed signal : se recalcule quand formValues() change
+      this.runtimeCache.set(key, computed(() => {
+        const values = this.formValues();
+        const state = this.engine.computeFieldState(field, values);
+
+        // Fusionner les options async si disponibles
+        const asyncCache = this.asyncOptionsCache.get(key);
+        if (asyncCache) {
+          const asyncOpts = asyncCache.options();
+          if (asyncOpts.length > 0) state.options = asyncOpts;
+          state.loading = asyncCache.loading();
+        }
+
+        return state;
+      }));
+
+      if (field.type === 'group' && field.children) {
+        this.initRuntimeCache(field.children, key);
+      }
+      if (field.type === 'array' && field.arrayConfig) {
+        this.initRuntimeCache(field.arrayConfig.itemFields, key);
+      }
+    }
+  }
+
+  private initAsyncOptions(fields: FieldConfig[], parentPath = ''): void {
+    for (const field of fields) {
+      const key = parentPath ? `${parentPath}.${field.key}` : field.key;
+
+      // Loader initial
+      if (field.optionsLoader) {
+        this.createAsyncLoader(key, field.optionsLoader);
+      }
+
+      // Loaders dans les dépendances
+      if (field.dependencies) {
+        for (const dep of field.dependencies) {
+          if (dep.effects.optionsLoader) {
+            this.createAsyncLoader(key, dep.effects.optionsLoader, dep);
+          }
+        }
+      }
+
+      if (field.children) this.initAsyncOptions(field.children, key);
+    }
+  }
+
+  private createAsyncLoader(
+    key: string,
+    loader: (fv: Record<string, any>) => Promise<SelectOption[]>,
+    rule?: DependencyRule
+  ): void {
+    if (!this.asyncOptionsCache.has(key)) {
+      this.asyncOptionsCache.set(key, {
+        options: signal<SelectOption[]>([]),
+        loading: signal(false),
+      });
+    }
+
+    const cache = this.asyncOptionsCache.get(key)!;
+    let lastTrigger = '';
+
+    // On utilise effect() pour réagir aux changements de formValues
+    effect(() => {
+      const values = this.formValues();
+
+      // Si une règle est associée, ne charger que si la condition est remplie
+      if (rule && !this.engine.evaluateRule(rule, values)) return;
+
+      // Déterminer si les dépendances sources ont changé
+      const trigger = rule
+        ? JSON.stringify(rule.conditions.map(c => this.engine.getNestedValue(values, c.field)))
+        : JSON.stringify(values);
+
+      if (trigger !== lastTrigger) {
+        lastTrigger = trigger;
+        cache.loading.set(true);
+        loader(values).then(opts => {
+          cache.options.set(opts);
+          cache.loading.set(false);
+          this.cdr.markForCheck();
+        }).catch(() => {
+          cache.options.set([]);
+          cache.loading.set(false);
+          this.cdr.markForCheck();
+        });
+      }
+    }, { allowSignalWrites: true });
+  }
+
+  private applyAllEffects(fields: FieldConfig[], formValues: Record<string, any>): void {
+    for (const field of fields) {
+      const key = field.key;
+      const stateSignal = this.runtimeCache.get(key);
+      if (!stateSignal) continue;
+
+      const state = stateSignal();
+      const prev = this.previousStates.get(key);
+
+      // Appliquer disable/enable et validators sur le FormControl
+      this.engine.applyControlEffects(field, state, this.formGroup, formValues, prev);
+
+      // Appliquer setValue / resetValue
+      this.engine.applySideEffects(field, this.formGroup, formValues);
+
+      this.previousStates.set(key, { ...state });
+
+      // Récursion
+      if (field.type === 'group' && field.children) {
+        this.applyAllEffects(field.children, formValues);
+      }
+    }
+  }
+
+
+  // ─── API publique ───
+
+  onSubmit(): void {
+    if (this.formGroup.valid) {
+      this.formSubmit.emit(this.formGroup.getRawValue());
+    } else {
+      this.markAllTouched(this.formGroup);
+      this.cdr.markForCheck();
+    }
+  }
+
+  onReset(): void {
+    const defaults = this.getDefaults(this.config.fields);
+    this.formGroup.reset(defaults);
+  }
+
+  /** Accès programmatique au FormGroup */
+  getFormGroup(): FormGroup { return this.formGroup; }
+
+  /** Mise à jour programmatique */
+  patchValue(values: Record<string, any>): void {
+    this.formGroup.patchValue(values);
+  }
+
+
+  // ─── Template helpers ───
+
+  /**
+   * Retourne l'état runtime d'un champ.
+   * Utilise le cache computed signal → recalcul automatique quand les valeurs changent.
+   */
+  getRuntimeState(field: FieldConfig): FieldRuntimeState {
+    const cached = this.runtimeCache.get(field.key);
+    if (cached) return cached();
+
+    // Fallback (ne devrait pas arriver en fonctionnement normal)
+    return this.engine.computeFieldState(field, this.formValues());
+  }
+
+  isTextInput(type: ControlType): boolean {
+    return ['text', 'number', 'email', 'password'].includes(type);
+  }
+
+  inputType(type: ControlType): string {
+    switch (type) {
+      case 'number': return 'number';
+      case 'email':  return 'email';
+      case 'password': return 'password';
+      default: return 'text';
+    }
+  }
+
+  fieldId(field: FieldConfig, parentPath: string): string {
+    return parentPath ? `${parentPath}_${field.key}` : field.key;
+  }
+
+  joinPath(...parts: string[]): string {
+    return parts.filter(Boolean).join('.');
+  }
+
+  getCtrl(fg: FormGroup, key: string): AbstractControl | null {
+    return fg.get(key);
+  }
+
+  asFormControl(fg: FormGroup, key: string): FormControl {
+    return fg.get(key) as FormControl;
+  }
+
+  asFormGroup(fg: FormGroup, key: string): FormGroup {
+    return fg.get(key) as FormGroup;
+  }
+
+  asFormArray(fg: FormGroup, key: string): FormArray {
+    return fg.get(key) as FormArray;
+  }
+
+  asFormGroupAt(fg: FormGroup, key: string, idx: number): FormGroup {
+    return (fg.get(key) as FormArray).at(idx) as FormGroup;
+  }
+
+  getError(field: FieldConfig, fg: FormGroup): string | null {
+    const ctrl = fg.get(field.key);
+    return ctrl ? this.engine.getErrorMessage(field, ctrl) : null;
+  }
+
+  addArrayItem(fg: FormGroup, field: FieldConfig): void {
+    if (!field.arrayConfig) return;
+    const arr = fg.get(field.key) as FormArray;
+    this.formBuilder.addArrayItem(arr, field.arrayConfig.itemFields, this.engine);
+    this.cdr.markForCheck();
+  }
+
+  removeArrayItem(fg: FormGroup, field: FieldConfig, index: number): void {
+    const arr = fg.get(field.key) as FormArray;
+    this.formBuilder.removeArrayItem(arr, index);
+    this.cdr.markForCheck();
+  }
+
+  // ─── Utilitaires privés ───
+
+  private markAllTouched(control: AbstractControl): void {
+    if (control instanceof FormControl) {
+      control.markAsTouched();
+    } else if (control instanceof FormGroup) {
+      Object.values(control.controls).forEach(c => this.markAllTouched(c));
+    } else if (control instanceof FormArray) {
+      control.controls.forEach(c => this.markAllTouched(c));
+    }
+  }
+
+  private getDefaults(fields: FieldConfig[]): Record<string, any> {
+    const d: Record<string, any> = {};
+    for (const f of fields) {
+      if (f.type === 'group' && f.children) {
+        d[f.key] = this.getDefaults(f.children);
+      } else {
+        d[f.key] = f.defaultValue ?? null;
+      }
+    }
+    return d;
+  }
+}
