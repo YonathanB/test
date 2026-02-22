@@ -1,3 +1,257 @@
+@if (formGroup) {
+  <form
+    [formGroup]="formGroup"
+    [class]="config.cssClass ?? ''"
+    class="df"
+    (ngSubmit)="onSubmit()"
+  >
+    @if (config.title || config.description) {
+      <div class="df__header">
+        @if (config.title) { <h2 class="mat-headline-5">{{ config.title }}</h2> }
+        @if (config.description) { <p class="mat-body-1 df__muted">{{ config.description }}</p> }
+      </div>
+    }
+
+    <div class="df__grid" [style.--df-cols]="config.layout?.columns ?? 1">
+      @for (field of config.fields; track field.key) {
+        <ng-container
+          [ngTemplateOutlet]="fieldTpl"
+          [ngTemplateOutletContext]="{ $implicit: field, fg: formGroup, parentPath: '' }"
+        ></ng-container>
+      }
+    </div>
+
+    <div class="df__actions">
+      @if (config.showReset) {
+        <button mat-stroked-button type="button" (click)="onReset()">
+          {{ config.resetLabel ?? 'Réinitialiser' }}
+        </button>
+      }
+      <button mat-flat-button color="primary" type="submit" [disabled]="config.disableSubmitIfInvalid && formGroup.invalid">
+        {{ config.submitLabel ?? 'Soumettre' }}
+      </button>
+    </div>
+  </form>
+}
+
+<ng-template #fieldTpl let-field let-fg="fg" let-parentPath="parentPath">
+  @if (getRuntimeState(field).visible) {
+    
+    @if (field.layout?.separator) {
+      <hr class="df__separator" style="grid-column: 1 / -1">
+    }
+
+    @if (field.layout?.sectionTitle) {
+      <div class="df__section" style="grid-column: 1 / -1">
+        <h3 class="mat-subtitle-1">{{ field.layout.sectionTitle }}</h3>
+        @if (field.layout.sectionDescription) {
+          <p class="mat-body-2 df__muted">{{ field.layout.sectionDescription }}</p>
+        }
+      </div>
+    }
+
+    <div
+      class="df__field-wrapper"
+      [class]="getRuntimeState(field).cssClass"
+      [style.grid-column]="'span ' + (field.layout?.colSpan ?? 1)"
+      [style.order]="field.layout?.order ?? null"
+    >
+      
+      @if (usesMatFormField(field.type)) {
+        <mat-form-field appearance="outline" class="df__full-width">
+          <mat-label>{{ getRuntimeState(field).label || field.label }}</mat-label>
+
+          @if (isTextInput(field.type) || field.type === 'date' || field.type === 'time') {
+            <input matInput
+                   [id]="fieldId(field, parentPath)"
+                   [type]="inputType(field.type)"
+                   [formControl]="asFormControl(fg, field.key)"
+                   [placeholder]="getRuntimeState(field).placeholder"
+                   [attr.min]="getRuntimeState(field).min"
+                   [attr.max]="getRuntimeState(field).max"
+                   [readonly]="getRuntimeState(field).readonly"
+                   [required]="getRuntimeState(field).required" />
+          }
+
+          @if (field.type === 'textarea') {
+            <textarea matInput
+                      [id]="fieldId(field, parentPath)"
+                      [formControl]="asFormControl(fg, field.key)"
+                      [placeholder]="getRuntimeState(field).placeholder"
+                      [readonly]="getRuntimeState(field).readonly"
+                      [required]="getRuntimeState(field).required"
+                      rows="4"></textarea>
+          }
+
+          @if (field.type === 'select') {
+            <mat-select [id]="fieldId(field, parentPath)"
+                        [formControl]="asFormControl(fg, field.key)"
+                        [required]="getRuntimeState(field).required">
+              @for (opt of getRuntimeState(field).options; track opt.value) {
+                <mat-option [value]="opt.value" [disabled]="opt.disabled ?? false">
+                  {{ opt.label }}
+                </mat-option>
+              }
+            </mat-select>
+          }
+
+          @if (field.prefix) { <span matTextPrefix>{{ field.prefix }}&nbsp;</span> }
+          @if (field.suffix) { <span matTextSuffix>&nbsp;{{ field.suffix }}</span> }
+          
+          @if (field.tooltip) { 
+            <mat-icon matSuffix [matTooltip]="field.tooltip" class="df__tooltip-icon">info</mat-icon> 
+          }
+          @if (getRuntimeState(field).loading) {
+            <mat-spinner matSuffix diameter="20"></mat-spinner>
+          }
+
+          @if (getRuntimeState(field).helpText) {
+            <mat-hint>{{ getRuntimeState(field).helpText }}</mat-hint>
+          }
+          @if (getCtrl(fg, field.key)?.invalid && getCtrl(fg, field.key)?.touched) {
+            <mat-error>{{ getError(field, fg) }}</mat-error>
+          }
+        </mat-form-field>
+      }
+
+      @if (field.type === 'checkbox') {
+        <div class="df__standalone-control">
+          <mat-checkbox [id]="fieldId(field, parentPath)"
+                        [formControl]="asFormControl(fg, field.key)"
+                        [required]="getRuntimeState(field).required">
+            {{ getRuntimeState(field).label || field.label }}
+          </mat-checkbox>
+          <ng-container *ngTemplateOutlet="standaloneErrors; context: { field: field, fg: fg }"></ng-container>
+        </div>
+      }
+
+      @if (field.type === 'radio') {
+        <div class="df__standalone-control">
+          <label class="mat-caption df__standalone-label">
+            {{ getRuntimeState(field).label || field.label }}
+            @if (getRuntimeState(field).required) { <span>*</span> }
+          </label>
+          <mat-radio-group [formControl]="asFormControl(fg, field.key)" class="df__radio-group">
+            @for (opt of getRuntimeState(field).options; track opt.value) {
+              <mat-radio-button [value]="opt.value" [disabled]="opt.disabled ?? false">
+                {{ opt.label }}
+              </mat-radio-button>
+            }
+          </mat-radio-group>
+          <ng-container *ngTemplateOutlet="standaloneErrors; context: { field: field, fg: fg }"></ng-container>
+        </div>
+      }
+
+      @if (field.type === 'toggle') {
+        <div class="df__standalone-control">
+          <mat-slide-toggle [id]="fieldId(field, parentPath)"
+                            [formControl]="asFormControl(fg, field.key)"
+                            [required]="getRuntimeState(field).required">
+            {{ getRuntimeState(field).label || field.label }}
+          </mat-slide-toggle>
+          <ng-container *ngTemplateOutlet="standaloneErrors; context: { field: field, fg: fg }"></ng-container>
+        </div>
+      }
+
+      @if (field.type === 'slider') {
+        <div class="df__standalone-control">
+          <label class="mat-caption df__standalone-label">{{ getRuntimeState(field).label || field.label }}</label>
+          <mat-slider [min]="getRuntimeState(field).min ?? 0"
+                      [max]="getRuntimeState(field).max ?? 100"
+                      [disabled]="getRuntimeState(field).disabled"
+                      discrete>
+            <input matSliderThumb [formControl]="asFormControl(fg, field.key)">
+          </mat-slider>
+          <ng-container *ngTemplateOutlet="standaloneErrors; context: { field: field, fg: fg }"></ng-container>
+        </div>
+      }
+
+      @if (field.type === 'hidden') {
+        <input type="hidden" [formControl]="asFormControl(fg, field.key)" />
+      }
+
+      @if (field.type === 'group' && field.children) {
+        <div class="df__group" [formGroupName]="field.key">
+          <div class="df__grid" [style.--df-cols]="config.layout?.columns ?? 1">
+            @for (child of field.children; track child.key) {
+              <ng-container
+                [ngTemplateOutlet]="fieldTpl"
+                [ngTemplateOutletContext]="{
+                  $implicit: child,
+                  fg: asFormGroup(fg, field.key),
+                  parentPath: joinPath(parentPath, field.key)
+                }"
+              ></ng-container>
+            }
+          </div>
+        </div>
+      }
+
+      @if (field.type === 'array' && field.arrayConfig) {
+        <div class="df__array" [formArrayName]="field.key">
+          @for (item of asFormArray(fg, field.key).controls; track $index) {
+            <div class="df__array-item" [formGroupName]="$index">
+              <div class="df__grid" [style.--df-cols]="config.layout?.columns ?? 1">
+                @for (child of field.arrayConfig.itemFields; track child.key) {
+                  <ng-container
+                    [ngTemplateOutlet]="fieldTpl"
+                    [ngTemplateOutletContext]="{
+                      $implicit: child,
+                      fg: asFormGroupAt(fg, field.key, $index),
+                      parentPath: joinPath(parentPath, field.key, '' + $index)
+                    }"
+                  ></ng-container>
+                }
+              </div>
+              @if (!field.arrayConfig.minItems || asFormArray(fg, field.key).length > (field.arrayConfig.minItems ?? 0)) {
+                <button mat-icon-button color="warn" type="button" (click)="removeArrayItem(fg, field, $index)" matTooltip="Supprimer">
+                  <mat-icon>delete</mat-icon>
+                </button>
+              }
+            </div>
+          }
+          @if (!field.arrayConfig.maxItems || asFormArray(fg, field.key).length < (field.arrayConfig.maxItems ?? 999)) {
+            <button mat-stroked-button color="primary" type="button" (click)="addArrayItem(fg, field)" class="df__btn-add">
+              <mat-icon>add</mat-icon>
+              {{ field.arrayConfig.addLabel ?? 'Ajouter un élément' }}
+            </button>
+          }
+        </div>
+      }
+
+      @if (field.type === 'custom' && field.customTemplateRef) {
+        @for (tpl of customTemplates; track tpl.name) {
+          @if (tpl.name === field.customTemplateRef) {
+            <ng-container
+              [ngTemplateOutlet]="tpl.templateRef"
+              [ngTemplateOutletContext]="{
+                $implicit: field,
+                control: getCtrl(fg, field.key),
+                formGroup: fg,
+                formValues: fg.getRawValue()
+              }"
+            ></ng-container>
+          }
+        }
+      }
+
+    </div>
+  }
+</ng-template>
+
+<ng-template #standaloneErrors let-field="field" let-fg="fg">
+  <div class="df__standalone-hints">
+    @if (getCtrl(fg, field.key)?.invalid && getCtrl(fg, field.key)?.touched) {
+      <mat-error class="mat-caption">{{ getError(field, fg) }}</mat-error>
+    } @else if (getRuntimeState(field).helpText) {
+      <mat-hint class="mat-caption df__muted">{{ getRuntimeState(field).helpText }}</mat-hint>
+    }
+  </div>
+</ng-template>
+
+
+
+
 // ============================================================================
 // DYNAMIC FORM COMPONENT — Angular 17 / Nx Library Compatible
 // ============================================================================
