@@ -3,6 +3,16 @@ https://claude.ai/share/0a8e2265-771d-400f-92a9-cf2a8f92a7fc
 
 
 https://claude.ai/public/artifacts/96fdb415-cf3b-4a97-8383-fdea6a2d169f
+
+
+https://claude.ai/public/artifacts/35f8aec9-7ee8-4948-8212-e2c0c9bfe0a5
+
+https://claude.ai/public/artifacts/79e2dd56-ff64-44e8-a912-205576b80fb9
+
+
+https://claude.ai/public/artifacts/f7b10b3f-3a36-43b1-96a9-bc571ccb22c8
+
+
 # Dynamic Form — Librairie Nx pour Angular 17
 
 ## Contraintes respectées
