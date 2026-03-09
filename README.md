@@ -1,5 +1,8 @@
 https://claude.ai/share/0a8e2265-771d-400f-92a9-cf2a8f92a7fc
 
+
+
+https://claude.ai/public/artifacts/96fdb415-cf3b-4a97-8383-fdea6a2d169f
 # Dynamic Form — Librairie Nx pour Angular 17
 
 ## Contraintes respectées
