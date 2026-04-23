@@ -1,3 +1,121 @@
+import { Component } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { FormsModule } from '@angular/forms';
+import { IFilterAngularComp } from 'ag-grid-angular';
+import { IFilterParams, IDoesFilterPassParams } from 'ag-grid-community';
+
+@Component({
+  selector: 'app-tabbed-filter',
+  standalone: true,
+  imports: [CommonModule, FormsModule],
+  template: `
+    <div class="custom-filter">
+      <div class="tabs">
+        <button 
+          (click)="activeTab = 'tab1'" 
+          [class.active]="activeTab === 'tab1'">
+          Valeur 1
+        </button>
+        <button 
+          (click)="activeTab = 'tab2'" 
+          [class.active]="activeTab === 'tab2'">
+          Valeur 2
+        </button>
+      </div>
+
+      <div class="tab-content" *ngIf="activeTab === 'tab1'">
+        <div class="filter-group">
+          <label>Filtre principal :</label>
+          <input 
+            type="text" 
+            [(ngModel)]="filterValue1" 
+            (ngModelChange)="onFilterChanged()" 
+            placeholder="Filtrer..."
+            class="ag-input-field-input ag-text-field-input" />
+        </div>
+      </div>
+
+      <div class="tab-content" *ngIf="activeTab === 'tab2'">
+        <div class="filter-group">
+          <label>Filtre secondaire :</label>
+          <input 
+            type="text" 
+            [(ngModel)]="filterValue2" 
+            (ngModelChange)="onFilterChanged()" 
+            placeholder="Filtrer..."
+            class="ag-input-field-input ag-text-field-input" />
+        </div>
+      </div>
+    </div>
+  `,
+  styles: [`
+    .custom-filter { width: 250px; background: white; }
+    .tabs { display: flex; border-bottom: 1px solid var(--ag-border-color, #babfc7); }
+    .tabs button { 
+      flex: 1; padding: 10px; border: none; background: #f8f8f8; cursor: pointer;
+      border-bottom: 2px solid transparent; 
+    }
+    .tabs button.active { 
+      background: white; border-bottom-color: var(--ag-alpine-active-color, #2196f3); font-weight: bold;
+    }
+    .tab-content { padding: 15px; }
+    .filter-group { display: flex; flex-direction: column; gap: 8px; }
+    input { padding: 5px; box-sizing: border-box; width: 100%; }
+  `]
+})
+export class TabbedFilterComponent implements IFilterAngularComp {
+  params!: IFilterParams;
+  
+  activeTab = 'tab1';
+  filterValue1 = '';
+  filterValue2 = '';
+
+  // Initialisation par AG Grid
+  agInit(params: IFilterParams): void {
+    this.params = params;
+  }
+
+  // Vérifie si le filtre est actif (l'icône d'entonnoir s'allumera)
+  isFilterActive(): boolean {
+    return this.filterValue1.trim() !== '' || this.filterValue2.trim() !== '';
+  }
+
+  // La logique de filtrage pour chaque ligne
+  doesFilterPass(params: IDoesFilterPassParams): boolean {
+    // On récupère la valeur de la cellule courante
+    const cellValue = this.params.getValue(params.node);
+    if (!cellValue) return false;
+
+    const cellValueLower = cellValue.toString().toLowerCase();
+    
+    // On vérifie les conditions (ici on fait un OU, mais vous pouvez faire un ET)
+    const pass1 = this.filterValue1 ? cellValueLower.includes(this.filterValue1.toLowerCase()) : false;
+    const pass2 = this.filterValue2 ? cellValueLower.includes(this.filterValue2.toLowerCase()) : false;
+
+    // Si les deux sont vides, on passe (bien que isFilterActive gère déjà ce cas)
+    if (!this.filterValue1 && !this.filterValue2) return true;
+
+    // Logique custom : la cellule doit correspondre au filtre 1 OU au filtre 2
+    return pass1 || pass2; 
+  }
+
+  // AG Grid API - pour sauvegarder l'état du filtre
+  getModel() {
+    if (!this.isFilterActive()) return null;
+    return { value1: this.filterValue1, value2: this.filterValue2 };
+  }
+
+  // AG Grid API - pour restaurer l'état du filtre
+  setModel(model: any) {
+    this.filterValue1 = model ? model.value1 : '';
+    this.filterValue2 = model ? model.value2 : '';
+  }
+
+  // Appelé quand l'utilisateur tape dans l'input
+  onFilterChanged() {
+    this.params.filterChangedCallback();
+  }
+}
 // libs/dynamic-form/src/lib/dynamic-form.component.ts
 
 import { 
