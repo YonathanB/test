@@ -1,40 +1,45 @@
-import { Component, signal } from '@angular/core';
+import { Component, signal, computed } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MatTabsModule } from '@angular/material/tabs';
-import { MatInputModule } from '@angular/material/input';
-import { MatFormFieldModule } from '@angular/material/form-field';
+import { MatCheckboxModule } from '@angular/material/checkbox';
 import { IFilterAngularComp } from 'ag-grid-angular';
 import { IFilterParams, IDoesFilterPassParams } from 'ag-grid-community';
 
 @Component({
-  selector: 'app-material-tabbed-filter',
+  selector: 'app-tabbed-set-filter',
   standalone: true,
-  imports: [FormsModule, MatTabsModule, MatInputModule, MatFormFieldModule],
+  imports: [FormsModule, MatTabsModule, MatCheckboxModule],
   template: `
     <div class="mat-filter-container">
       <mat-tab-group>
         
-        <mat-tab label="Valeur 1">
-          <div class="tab-content">
-            <mat-form-field appearance="outline">
-              <mat-label>Filtre principal</mat-label>
-              <input matInput 
-                     [ngModel]="filterValue1()" 
-                     (ngModelChange)="onFilter1Change($event)" 
-                     placeholder="Saisissez une valeur..." />
-            </mat-form-field>
+        <mat-tab label="Valeurs Type 1">
+          <div class="checkbox-list">
+            @for (val of valuesTab1(); track val) {
+              <mat-checkbox 
+                [checked]="selectedValuesTab1().has(val)"
+                (change)="toggleSelectionTab1(val)">
+                {{ val }}
+              </mat-checkbox>
+            }
+            @if (valuesTab1().length === 0) {
+              <p class="empty-msg">Aucune valeur</p>
+            }
           </div>
         </mat-tab>
 
-        <mat-tab label="Valeur 2">
-          <div class="tab-content">
-            <mat-form-field appearance="outline">
-              <mat-label>Filtre secondaire</mat-label>
-              <input matInput 
-                     [ngModel]="filterValue2()" 
-                     (ngModelChange)="onFilter2Change($event)" 
-                     placeholder="Saisissez une valeur..." />
-            </mat-form-field>
+        <mat-tab label="Valeurs Type 2">
+          <div class="checkbox-list">
+            @for (val of valuesTab2(); track val) {
+              <mat-checkbox 
+                [checked]="selectedValuesTab2().has(val)"
+                (change)="toggleSelectionTab2(val)">
+                {{ val }}
+              </mat-checkbox>
+            }
+            @if (valuesTab2().length === 0) {
+              <p class="empty-msg">Aucune valeur</p>
+            }
           </div>
         </mat-tab>
 
@@ -42,64 +47,97 @@ import { IFilterParams, IDoesFilterPassParams } from 'ag-grid-community';
     </div>
   `,
   styles: [`
-    /* On ajuste la largeur pour que les onglets Material s'affichent correctement */
-    .mat-filter-container { width: 300px; background: white; }
-    .tab-content { padding: 16px; display: flex; flex-direction: column; }
-    mat-form-field { width: 100%; }
-    
-    /* Optionnel : Supprimer le padding par défaut d'AG Grid autour du filtre */
+    .mat-filter-container { width: 300px; background: white; max-height: 400px; display: flex; flex-direction: column; }
+    .checkbox-list { padding: 16px; display: flex; flex-direction: column; gap: 8px; max-height: 250px; overflow-y: auto; }
+    .empty-msg { color: gray; font-size: 12px; font-style: italic; }
     :host { display: block; margin: -4px; }
   `]
 })
-export class MaterialTabbedFilterComponent implements IFilterAngularComp {
+export class TabbedSetFilterComponent implements IFilterAngularComp {
   private params!: IFilterParams;
-  
-  // Utilisation des Signals d'Angular 20 pour un état prévisible et performant
-  filterValue1 = signal('');
-  filterValue2 = signal('');
+
+  // Les listes de valeurs disponibles pour chaque onglet
+  valuesTab1 = signal<string[]>([]);
+  valuesTab2 = signal<string[]>([]);
+
+  // L'état des cases cochées (on utilise un Set pour des recherches rapides)
+  selectedValuesTab1 = signal<Set<string>>(new Set());
+  selectedValuesTab2 = signal<Set<string>>(new Set());
 
   agInit(params: IFilterParams): void {
     this.params = params;
+    this.extractUniqueValues();
+  }
+
+  // Méthode pour peupler tes listes de valeurs à partir des données de la grille
+  private extractUniqueValues() {
+    const tab1Set = new Set<string>();
+    const tab2Set = new Set<string>();
+
+    this.params.api.forEachLeafNode(node => {
+      // Adapter ici selon la structure de tes données. 
+      // Par exemple, si ta ligne contient { type1: 'A', type2: 'B' }
+      const data = node.data;
+      if (data) {
+        if (data.valeurType1) tab1Set.add(data.valeurType1);
+        if (data.valeurType2) tab2Set.add(data.valeurType2);
+      }
+    });
+
+    // On convertit les Set en tableaux triés pour l'affichage
+    this.valuesTab1.set(Array.from(tab1Set).sort());
+    this.valuesTab2.set(Array.from(tab2Set).sort());
+  }
+
+  toggleSelectionTab1(val: string) {
+    const currentSet = new Set(this.selectedValuesTab1());
+    if (currentSet.has(val)) {
+      currentSet.delete(val);
+    } else {
+      currentSet.add(val);
+    }
+    this.selectedValuesTab1.set(currentSet);
+    this.params.filterChangedCallback();
+  }
+
+  toggleSelectionTab2(val: string) {
+    const currentSet = new Set(this.selectedValuesTab2());
+    if (currentSet.has(val)) {
+      currentSet.delete(val);
+    } else {
+      currentSet.add(val);
+    }
+    this.selectedValuesTab2.set(currentSet);
+    this.params.filterChangedCallback();
   }
 
   isFilterActive(): boolean {
-    return this.filterValue1().trim() !== '' || this.filterValue2().trim() !== '';
+    // Le filtre est actif si au moins une case est cochée dans l'un des onglets
+    return this.selectedValuesTab1().size > 0 || this.selectedValuesTab2().size > 0;
   }
 
   doesFilterPass(params: IDoesFilterPassParams): boolean {
-    const cellValue = this.params.getValue(params.node);
-    if (cellValue == null) return false;
+    const data = params.node.data;
+    if (!data) return false;
 
-    const cellValueLower = cellValue.toString().toLowerCase();
-    
-    // Lecture des valeurs via l'appel des signals
-    const val1 = this.filterValue1().toLowerCase();
-    const val2 = this.filterValue2().toLowerCase();
-    
-    const pass1 = val1 ? cellValueLower.includes(val1) : false;
-    const pass2 = val2 ? cellValueLower.includes(val2) : false;
+    // Logique de filtrage. Si des cases sont cochées dans l'onglet 1, la ligne doit correspondre.
+    const passTab1 = this.selectedValuesTab1().size === 0 || this.selectedValuesTab1().has(data.valeurType1);
+    const passTab2 = this.selectedValuesTab2().size === 0 || this.selectedValuesTab2().has(data.valeurType2);
 
-    return pass1 || pass2;
+    // Ajuste avec un || (OU) ou un && (ET) selon ton besoin métier
+    return passTab1 && passTab2; 
   }
 
   getModel() {
     if (!this.isFilterActive()) return null;
-    return { value1: this.filterValue1(), value2: this.filterValue2() };
+    return {
+      tab1: Array.from(this.selectedValuesTab1()),
+      tab2: Array.from(this.selectedValuesTab2())
+    };
   }
 
   setModel(model: any) {
-    // Mise à jour des signals lors de la restauration de l'état
-    this.filterValue1.set(model?.value1 || '');
-    this.filterValue2.set(model?.value2 || '');
-  }
-
-  onFilter1Change(newValue: string) {
-    this.filterValue1.set(newValue);
-    this.params.filterChangedCallback(); // Notifie AG Grid de relancer le filtrage
-  }
-
-  onFilter2Change(newValue: string) {
-    this.filterValue2.set(newValue);
-    this.params.filterChangedCallback();
+    this.selectedValuesTab1.set(new Set(model?.tab1 || []));
+    this.selectedValuesTab2.set(new Set(model?.tab2 || []));
   }
 }
