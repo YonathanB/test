@@ -1,3 +1,21 @@
+
+Agis en tant qu'expert Angular et UI/UX. Je dois développer un composant de mapping de données JSON visuel et interactif en utilisant Angular et Angular Material (spécifiquement @angular/cdk/drag-drop et @angular/material/tree). Merci d'utiliser la syntaxe moderne d'Angular (Standalone components, Signals, control flow).
+​Architecture de l'interface (Split Screen) :
+​1. Panneau de gauche (Source des données) :
+​Doit afficher un fichier JSON potentiellement imbriqué sous forme d'arborescence (MatTree).
+​Règle UX cruciale : L'utilisateur final ne connaît pas les clés techniques du JSON, il réagit aux valeurs. Chaque nœud de l'arbre doit donc impérativement afficher la clé ET un échantillon de la valeur (ex: email: "jean.dupont@test.com" au lieu de juste email).
+​Les nœuds finaux (les feuilles de l'arbre contenant les valeurs) doivent être configurés comme des éléments glissables (cdkDrag).
+​2. Panneau de droite (Cible / Mapping) :
+​Affiche une liste de rubriques/labels existants de mon interface.
+​Ces rubriques doivent agir comme des zones de réception (cdkDropList).
+​L'utilisateur doit pouvoir glisser un élément du panneau de gauche et le lâcher sur une rubrique du panneau de droite pour établir le "map".
+​Fonctionnalité d'ajout : Présence d'un bouton "Ajouter une nouvelle rubrique" permettant à l'utilisateur de créer dynamiquement un nouveau label cible (input textuel) si la donnée du JSON ne correspond à rien d'existant, puis d'y glisser sa donnée.
+​Livrables attendus :
+​Le code du composant (TypeScript avec Signals pour gérer l'état du mapping et de l'arbre, HTML, et SCSS avec Flexbox/Grid pour la mise en page).
+​L'implémentation complète du Drag & Drop CDK entre le MatTree et la liste.
+​Une structure de données finale qui exporte le résultat du mapping sous forme d'objet clé/valeur.
+​Un petit jeu de données mockées (JSON source et rubriques cibles initiales) pour que je puisse tester le rendu immédiatement.
+
 import { Component, signal, computed } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { MatTabsModule } from '@angular/material/tabs';
