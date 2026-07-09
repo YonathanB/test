@@ -1,3 +1,205 @@
+from pyspark.sql import Window, functions as F
+
+# ══════════════════════════════════════════════════════════════════
+#  PARAMÈTRES DU JOUR
+# ══════════════════════════════════════════════════════════════════
+J             = "20240320"      # jour traité (format yyyyMMdd)
+FENETRE_DEBUT = "20231221"      # J - ~90 jours : profondeur de recalcul
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ÉTAPE 1 — BRONZE → schéma commun (adaptateurs, 1 par logique)
+#  On lit tout le Bronze récent ; le filtrage par sujet actif vient en étape 3.
+# ══════════════════════════════════════════════════════════════════
+def adapter_logique_A(spark):
+    return (spark.table("bronze_logique_A")
+        .select(
+            F.col("device_id").alias("subject_id"),
+            F.lit("logique_A").alias("logic"),
+            F.col("jour").alias("date"),
+            F.col("ville").alias("lieu"),
+            F.col("pays").alias("pays"),
+            F.col("latitude").alias("lat"),
+            F.col("longitude").alias("lon"),
+            F.col("id").alias("raw_source_id")))
+
+def adapter_logique_B(spark):
+    return (spark.table("bronze_logique_B")
+        .select(
+            F.col("user_ref").alias("subject_id"),
+            F.lit("logique_B").alias("logic"),
+            F.col("date_obs").alias("date"),
+            F.col("city").alias("lieu"),
+            F.col("country").alias("pays"),
+            F.lit(None).cast("double").alias("lat"),
+            F.lit(None).cast("double").alias("lon"),
+            F.col("row_id").alias("raw_source_id")))
+
+ADAPTERS = [adapter_logique_A, adapter_logique_B]   # ajouter une logique = 1 ligne ici
+
+def build_silver_raw(spark, date_min, date_max):
+    from functools import reduce
+    dfs = [a(spark).where((F.col("date") >= date_min) & (F.col("date") <= date_max))
+           for a in ADAPTERS]
+    return reduce(lambda x, y: x.unionByName(y), dfs)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ÉTAPE 2 — MAPPING : person_id + consensus_key (jointure normale)
+# ══════════════════════════════════════════════════════════════════
+def add_consensus_key(spark, df):
+    w = Window.partitionBy("subject_id").orderBy(F.col("rank").asc())  # rank=1 = meilleur
+    mapping_best = (spark.table("subject_person_map")
+        .withColumn("rn", F.row_number().over(w))
+        .where(F.col("rn") == 1)
+        .select("subject_id", "person_id"))
+    return (df.join(mapping_best, "subject_id", "left")
+              .withColumn("consensus_key", F.coalesce("person_id", "subject_id")))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ÉTAPE 3 — NETTOYAGE : flaguer les spikes spatio-temporels
+# ══════════════════════════════════════════════════════════════════
+def clean_spikes(df):
+    w = Window.partitionBy("consensus_key", "logic").orderBy("d")
+    return (df
+        .withColumn("d", F.to_date("date", "yyyyMMdd"))
+        .withColumn("prev_lieu", F.lag("lieu").over(w))
+        .withColumn("next_lieu", F.lead("lieu").over(w))
+        .withColumn("quality", F.when(
+            (F.col("lieu") != F.col("prev_lieu")) &
+            (F.col("lieu") != F.col("next_lieu")) &
+            (F.col("prev_lieu") == F.col("next_lieu")),
+            F.lit("spike")).otherwise(F.lit("ok"))))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ÉTAPE 4 — SCORING au grain JOUR (par-logique + consensus)
+# ══════════════════════════════════════════════════════════════════
+def build_daily(spark, silver_clean):
+    reg = spark.table("logic_registry").select("logic", "fiabilite")
+    raw_struct = F.struct("logic", "subject_id", "date", "lieu", "pays",
+                          "lat", "lon", "raw_source_id")
+
+    logic_day = (silver_clean.where(F.col("quality") == "ok")
+        .withColumn("raw", raw_struct)
+        .join(reg, "logic")
+        .groupBy("consensus_key", "d", "lieu", "pays", "logic")
+        .agg(F.first("fiabilite").alias("w"),
+             F.first("person_id", ignorenulls=True).alias("person_id"),
+             F.collect_list("raw").alias("raw")))
+
+    per_logic = logic_day.select(
+        "consensus_key", "d", "lieu", "pays", "person_id", "logic",
+        F.col("w").alias("score"),
+        F.array("logic").alias("contributing_logics"),
+        F.lit(1).alias("n_logics"), "raw")
+
+    consensus = (logic_day
+        .groupBy("consensus_key", "d", "lieu", "pays")
+        .agg((F.lit(1.0) - F.exp(F.sum(F.log(F.lit(1.0) - F.col("w"))))).alias("score"),
+             F.collect_set("logic").alias("contributing_logics"),
+             F.countDistinct("logic").alias("n_logics"),
+             F.first("person_id", ignorenulls=True).alias("person_id"),
+             F.flatten(F.collect_list("raw")).alias("raw"))
+        .withColumn("logic", F.lit("consensus")))
+
+    return per_logic.unionByName(consensus)
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ÉTAPE 5 — INTERVALLES : gaps & islands
+# ══════════════════════════════════════════════════════════════════
+def build_intervals(daily):
+    w = Window.partitionBy("consensus_key", "logic", "lieu").orderBy("d")
+    islands = (daily
+        .withColumn("prev", F.lag("d").over(w))
+        .withColumn("gap", F.when(
+            F.col("prev").isNull() | (F.datediff("d", "prev") > 1), 1).otherwise(0))
+        .withColumn("island_id", F.sum("gap").over(w)))
+
+    intervals = (islands
+        .groupBy("consensus_key", "logic", "lieu", "island_id")
+        .agg(F.min("d").alias("gte_d"), F.max("d").alias("lte_d"),
+             F.first("pays").alias("pays"),
+             F.first("person_id", ignorenulls=True).alias("person_id"),
+             F.avg("score").alias("score"),
+             F.max("n_logics").alias("n_logics"),
+             F.array_distinct(F.flatten(F.collect_list("contributing_logics")))
+                 .alias("contributing_logics"),
+             F.flatten(F.collect_list("raw")).alias("raw_data")))
+
+    return (intervals
+        .withColumn("periode", F.struct(
+            F.date_format("gte_d", "yyyyMMdd").alias("gte"),
+            F.date_format("lte_d", "yyyyMMdd").alias("lte")))
+        .withColumn("doc_id", F.concat_ws("_",
+            "logic", "consensus_key", "lieu", F.date_format("gte_d", "yyyyMMdd")))
+        .select("doc_id", "consensus_key", "person_id", "logic", "lieu", "pays",
+                "periode", "score", "contributing_logics", "n_logics", "raw_data"))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  ÉTAPE 6 — ÉCRITURE GOLD (delete-then-write sur la fenêtre des clés touchées)
+#  Le delete d'abord élimine les fantômes (fusion/redécoupage d'intervalles).
+# ══════════════════════════════════════════════════════════════════
+def write_gold(spark, gold, cles_actives, date_min, table="gold_intervalles"):
+    spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+
+    if not spark.catalog.tableExists(table):
+        # première exécution : la table n'existe pas encore, simple création
+        (gold.write.format("parquet").mode("overwrite")
+            .partitionBy("logic").saveAsTable(table))
+        return
+
+    # 1. lire l'existant, retirer les clés touchées sur la fenêtre (purge des fantômes)
+    ancien = spark.table(table)
+    a_garder = ancien.join(
+        cles_actives.withColumn("_t", F.lit(True)),
+        "consensus_key", "left")
+    a_garder = (a_garder
+        # on retire les lignes des clés touchées dont la période commence dans la fenêtre
+        .where(~((F.col("_t") == True) & (F.col("periode.gte") >= date_min)))
+        .drop("_t"))
+
+    # 2. nouvel état = ancien épuré + gold recalculé
+    nouveau = a_garder.unionByName(gold)
+
+    # 3. réécriture
+    (nouveau.write.format("parquet").mode("overwrite")
+        .partitionBy("logic").saveAsTable(table))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  PROCESS QUOTIDIEN — enchaînement complet Bronze → Gold
+# ══════════════════════════════════════════════════════════════════
+def run_incremental(spark, J, FENETRE_DEBUT):
+    # (a) Bronze récent uniformisé
+    silver_raw = build_silver_raw(spark, FENETRE_DEBUT, J)
+
+    # (b) mapping → consensus_key
+    silver_keyed = add_consensus_key(spark, silver_raw)
+
+    # (c) QUELLES clés ont bougé AUJOURD'HUI ? ← le cœur de l'incrémental
+    cles_actives = (silver_keyed
+        .where(F.col("date") == J)
+        .select("consensus_key").distinct())
+
+    # (d) on restreint tout le traitement à ces clés (sur la fenêtre)
+    scope = silver_keyed.join(cles_actives, "consensus_key", "inner")
+
+    # (e) nettoyage → scoring → intervalles (identique, sur le périmètre réduit)
+    silver_clean = clean_spikes(scope)
+    daily        = build_daily(spark, silver_clean)
+    gold         = build_intervals(daily)
+
+    # (f) écriture Gold avec purge des fantômes
+    write_gold(spark, gold, cles_actives, FENETRE_DEBUT)
+    return gold
+
+
+# gold = run_incremental(spark, J, FENETRE_DEBUT)
+
 # ============================================================
 # PYSPARK PIPELINE (Hive + Metastore, sans Delta)
 # Objectif:
