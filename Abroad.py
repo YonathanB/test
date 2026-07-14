@@ -192,36 +192,53 @@ def _consensus_depuis_logic_day(logic_day):
         .groupBy("consensus_key", "d", "lieu", "pays")
         .agg((F.lit(1.0) - F.exp(F.sum(F.log(F.lit(1.0) - _w_eff())))).alias("score"),
              F.collect_set("logic").alias("contributing_logics"),
+             F.array_distinct(F.flatten(F.collect_list("subjects")))
+                 .alias("contributing_subjects"),
              F.countDistinct("logic").alias("n_logics"),
              F.first("person_id", ignorenulls=True).alias("person_id"),
              F.flatten(F.collect_list("raw")).alias("raw"))
-        .withColumn("logic", F.lit("consensus")))
+        .withColumn("logic", F.lit("consensus"))
+        .withColumn("subject_id", F.lit(None).cast("string")))   # consensus = niveau personne
 
 def build_daily(silver_clean, reg):
     raw_struct = F.struct("logic", "subject_id", "date", "lieu", "pays",
                           "lat", "lon", "raw_source_id", "extras")
 
-    logic_day = (silver_clean.where(F.col("quality") == "ok")
+    # grain SUBJECT : une ligne par (clé, subject, jour, lieu, logique)
+    # -> pour un même person_id, résultats distincts par subject sur une même période
+    subject_day = (silver_clean.where(F.col("quality") == "ok")
         .withColumn("raw", raw_struct)
         .join(reg, "logic")
-        .groupBy("consensus_key", "d", "lieu", "pays", "logic")
+        .groupBy("consensus_key", "subject_id", "d", "lieu", "pays", "logic")
         .agg(F.first("fiabilite").alias("w"),
              F.first("person_id", ignorenulls=True).alias("person_id"),
              F.collect_list("raw").alias("raw")))
 
-    per_logic = logic_day.select(
-        "consensus_key", "d", "lieu", "pays", "person_id", "logic",
+    per_logic = subject_day.select(
+        "consensus_key", "subject_id", "d", "lieu", "pays", "person_id", "logic",
         F.col("w").alias("score"),
         F.array("logic").alias("contributing_logics"),
+        F.array("subject_id").alias("contributing_subjects"),
         F.lit(1).alias("n_logics"), "raw")
+
+    # grain LOGIQUE (subjects fusionnés) : sert au consensus.
+    # Une logique n'est comptée qu'UNE fois dans le noisy-OR, même portée
+    # par plusieurs subjects de la même personne (pas de double comptage).
+    logic_day = (subject_day
+        .groupBy("consensus_key", "d", "lieu", "pays", "logic")
+        .agg(F.first("w").alias("w"),
+             F.first("person_id", ignorenulls=True).alias("person_id"),
+             F.collect_set("subject_id").alias("subjects"),
+             F.flatten(F.collect_list("raw")).alias("raw")))
 
     return per_logic.unionByName(_consensus_depuis_logic_day(logic_day))
 
 def _forme_gold_jour(daily):
     return (daily
         .withColumn("date", F.date_format("d", "yyyyMMdd"))
-        .select("consensus_key", "person_id", "lieu", "pays", "logic",
-                "score", "contributing_logics", "n_logics", "raw", "date"))
+        .select("consensus_key", "person_id", "subject_id", "lieu", "pays", "logic",
+                "score", "contributing_logics", "contributing_subjects",
+                "n_logics", "raw", "date"))
 
 
 # =====================================================================
@@ -271,6 +288,7 @@ def relink(spark, J, reg):
         .groupBy("consensus_key", "d", "lieu", "pays", "logic")
         .agg(F.first("fiabilite").alias("w"),
              F.first("person_id", ignorenulls=True).alias("person_id"),
+             F.collect_set("subject_id").alias("subjects"),
              F.collect_list("raw_one").alias("raw")))
     consensus_neuf = _forme_gold_jour(_consensus_depuis_logic_day(logic_day))
 
@@ -360,20 +378,22 @@ def purge(spark, J):
 # =====================================================================
 def _intervalles(jour):
     d = jour.withColumn("d", F.to_date("date", "yyyyMMdd"))
-    w = Window.partitionBy("consensus_key", "logic", "lieu").orderBy("d")
+    w = Window.partitionBy("consensus_key", "logic", "subject_id", "lieu").orderBy("d")
     islands = (d
         .withColumn("prev", F.lag("d").over(w))
         .withColumn("gap", F.when(
             F.col("prev").isNull() | (F.datediff("d", "prev") > 1), 1).otherwise(0))
         .withColumn("island_id", F.sum("gap").over(w)))
     return (islands
-        .groupBy("consensus_key", "logic", "lieu", "island_id")
+        .groupBy("consensus_key", "logic", "subject_id", "lieu", "island_id")
         .agg(F.min("d").alias("gte_d"), F.max("d").alias("lte_d"),
              F.first("pays").alias("pays"),
              F.avg("score").alias("score"),
              F.max("n_logics").alias("n_logics"),
              F.array_distinct(F.flatten(F.collect_list("contributing_logics")))
-                 .alias("contributing_logics"))
+                 .alias("contributing_logics"),
+             F.array_distinct(F.flatten(F.collect_list("contributing_subjects")))
+                 .alias("contributing_subjects"))
         .withColumn("nb_jours", F.datediff("lte_d", "gte_d") + 1)
         .withColumn("periode", F.struct(
             F.date_format("gte_d", "yyyyMMdd").alias("gte"),
@@ -383,23 +403,28 @@ def build_gold_personnes(spark):
     jour = spark.table(GOLD_JOUR).where(F.col("person_id").isNotNull())
 
     itv = _intervalles(jour).withColumn("sejour", F.struct(
-        "lieu", "pays", "periode", "nb_jours", "score", "contributing_logics", "n_logics"))
+        "lieu", "pays", "periode", "nb_jours", "score",
+        "contributing_logics", "contributing_subjects", "n_logics"))
 
     voyages = (itv.where(F.col("logic") == "consensus")
         .groupBy("consensus_key").agg(F.collect_list("sejour").alias("voyages")))
 
+    # détail au grain (logique, subject) : un même person_id peut montrer
+    # des séjours différents sur une même période selon le subject
     detail_sejours = (itv.where(F.col("logic") != "consensus")
-        .groupBy("consensus_key", "logic")
+        .groupBy("consensus_key", "logic", "subject_id")
         .agg(F.collect_list(F.struct("lieu", "pays", "periode", "nb_jours")).alias("sejours")))
 
     counts = (jour.where(F.col("logic") != "consensus")
-        .groupBy("consensus_key", "logic", "date")
+        .groupBy("consensus_key", "logic", "subject_id", "date")
         .agg(F.sum(F.size("raw")).alias("nb_events")))
-    detail_counts = (counts.groupBy("consensus_key", "logic")
+    detail_counts = (counts.groupBy("consensus_key", "logic", "subject_id")
         .agg(F.collect_list(F.struct("date", "nb_events")).alias("evenements_par_jour"),
              F.sum("nb_events").alias("nb_events")))
-    detail = (detail_sejours.join(detail_counts, ["consensus_key", "logic"], "full")
-        .withColumn("bloc", F.struct("logic", "sejours", "evenements_par_jour", "nb_events"))
+    detail = (detail_sejours.join(detail_counts,
+            ["consensus_key", "logic", "subject_id"], "full")
+        .withColumn("bloc", F.struct("logic", "subject_id",
+            "sejours", "evenements_par_jour", "nb_events"))
         .groupBy("consensus_key").agg(F.collect_list("bloc").alias("detail_logiques")))
 
     evt = (counts.groupBy("consensus_key", "logic").agg(F.sum("nb_events").alias("n"))
@@ -434,7 +459,7 @@ def compaction_par_cle(spark):
     if _table_existe(spark, T_TOMBSTONES):
         morts = spark.table(T_TOMBSTONES).select("consensus_key").distinct()
         df = df.join(morts, "consensus_key", "left_anti")
-    df = df.dropDuplicates(["consensus_key", "date", "lieu", "logic"])
+    df = df.dropDuplicates(["consensus_key", "subject_id", "date", "lieu", "logic"])
     (df.repartition("bucket").sortWithinPartitions("consensus_key", "date")
        .write.format("parquet").mode("overwrite")
        .partitionBy("bucket").saveAsTable(GOLD_PAR_CLE + "_new"))
@@ -447,11 +472,12 @@ def compaction_par_cle(spark):
 # =====================================================================
 #  ORCHESTRATEUR QUOTIDIEN
 # =====================================================================
-def run_quotidien(spark, J, jdbc_url, jdbc_props):
+def run_quotidien(spark, J, jdbc_url, jdbc_props, avec_relink=True):
     configs = charger_configs(spark, jdbc_url, jdbc_props)   # la config Oracle pilote tout
     reg     = registre_df(spark, configs)
 
-    relink(spark, J, reg)              # 1. sauver d'abord
+    if avec_relink:                    # 1. sauver d'abord — ÉTAPE OPTIONNELLE
+        relink(spark, J, reg)          #    (peut être planifiée moins souvent / à la demande)
     ingest(spark, J, configs, reg)     # 2. le jour (tampon)
     purge(spark, J)                    # 3. faucher en dernier
     build_gold_personnes(spark)        # 4. la vue personnes
