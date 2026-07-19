@@ -153,31 +153,86 @@ def build_silver_raw(spark, configs, dmin, dmax):
 
 
 # =====================================================================
-#  MAPPING IDENTITÉ (table déjà rank=1)
+#  MAPPING IDENTITÉ
+#  Table volumineuse (~600M après filtre priority=1), taux de match faible.
 # =====================================================================
 def mapping_df(spark):
     return (spark.table(T_MAPPING)
-        .select("subject_id", "person_id").dropDuplicates(["subject_id"]))
+        .where(F.col("priority") == 1)                       # EN PREMIER : réduit le volume
+        .select("subject_id", "person_id",
+                F.col("rank").alias("mapping_score"))        # note du lien, gardée comme attribut
+        .dropDuplicates(["subject_id"]))
 
 def add_consensus_key(spark, df):
-    return (df.join(mapping_df(spark), "subject_id", "left")
+    # Join gros x gros (~600M matchables, taux de match faible) :
+    # 1) semi-join pour isoler les subjects du flux réellement présents dans le mapping,
+    # 2) le résultat (petit, ~300k) est broadcasté sur le gros flux -> pas de shuffle massif.
+    # rank conservé comme attribut `mapping_score` (n'influence PAS le score consensus).
+    subj = df.select("subject_id").distinct()
+    resolus = (mapping_df(spark)
+        .join(subj, "subject_id", "left_semi"))              # seulement les ~300k matchés
+    return (df.join(F.broadcast(resolus), "subject_id", "left")
               .withColumn("consensus_key", F.coalesce("person_id", "subject_id")))
 
 
 # =====================================================================
 #  NETTOYAGE : flag des spikes
 # =====================================================================
-def clean_spikes(df):
-    w = Window.partitionBy("consensus_key", "logic").orderBy("d")
-    return (df
-        .withColumn("d", F.to_date("date", "yyyyMMdd"))
+def clean_spikes(subject_day):
+    """Détection de spikes AU NIVEAU PERSONNE (consensus_key), toutes logiques
+    et tous subjects confondus.
+
+    3 temps, pour garder la window légère ET l'ordre non ambigu :
+      1) réduire à UN lieu dominant par (consensus_key, jour)
+      2) window lag/lead sur ce grain : 1 ligne par jour, ordre par date sans ambiguïté
+      3) re-marquer les lignes d'origine par (consensus_key, jour)
+
+    Effet de bord voulu : une logique qui pose souvent un lieu contredit par
+    l'ensemble des autres ressort via les jours flagués -> permet d'identifier
+    les logiques peu fiables (cf. diagnostic_logiques_suspectes).
+    """
+    # 1. lieu DOMINANT du jour au niveau personne (majorité des lignes ; départage stable)
+    compte = (subject_day.groupBy("consensus_key", "d", "lieu")
+        .agg(F.count(F.lit(1)).alias("n")))
+    wmaj = Window.partitionBy("consensus_key", "d").orderBy(F.desc("n"), F.asc("lieu"))
+    jour_cle = (compte
+        .withColumn("rn", F.row_number().over(wmaj))
+        .where(F.col("rn") == 1)
+        .select("consensus_key", "d", "lieu"))
+
+    # 2. spike = lieu isolé un jour, encadré par deux voisins concordants
+    w = Window.partitionBy("consensus_key").orderBy("d")
+    spikes = (jour_cle
         .withColumn("prev_lieu", F.lag("lieu").over(w))
         .withColumn("next_lieu", F.lead("lieu").over(w))
-        .withColumn("quality", F.when(
-            (F.col("lieu") != F.col("prev_lieu")) &
-            (F.col("lieu") != F.col("next_lieu")) &
-            (F.col("prev_lieu") == F.col("next_lieu")),
-            F.lit("spike")).otherwise(F.lit("ok"))))
+        .where((F.col("lieu") != F.col("prev_lieu")) &
+               (F.col("lieu") != F.col("next_lieu")) &
+               (F.col("prev_lieu") == F.col("next_lieu")))
+        .select("consensus_key", "d")
+        .withColumn("est_spike", F.lit(True)))
+
+    # 3. re-marquage des lignes d'origine (jour entier de la personne flagué)
+    return (subject_day
+        .join(F.broadcast(spikes), ["consensus_key", "d"], "left")
+        .withColumn("quality", F.when(F.col("est_spike"), F.lit("spike"))
+                                .otherwise(F.lit("ok")))
+        .drop("est_spike"))
+
+
+def diagnostic_logiques_suspectes(subject_day, clean):
+    """Quelles logiques contredisent le plus le lieu dominant de la personne ?
+    Sert à repérer les logiques peu fiables (à ajuster dans la config Oracle)."""
+    dominant = (clean.where(F.col("quality") == "ok")
+        .groupBy("consensus_key", "d")
+        .agg(F.first("lieu").alias("lieu_dominant")))
+    return (subject_day.join(dominant, ["consensus_key", "d"], "inner")
+        .withColumn("contredit", F.col("lieu") != F.col("lieu_dominant"))
+        .groupBy("logic")
+        .agg(F.count(F.lit(1)).alias("n_jours"),
+             F.sum(F.col("contredit").cast("int")).alias("n_contradictions"))
+        .withColumn("taux_contradiction",
+                    F.round(F.col("n_contradictions") / F.col("n_jours"), 4))
+        .orderBy(F.desc("taux_contradiction")))
 
 
 # =====================================================================
@@ -200,31 +255,34 @@ def _consensus_depuis_logic_day(logic_day):
         .withColumn("logic", F.lit("consensus"))
         .withColumn("subject_id", F.lit(None).cast("string")))   # consensus = niveau personne
 
-def build_daily(silver_clean, reg):
+def build_subject_day(silver_keyed, reg):
+    """RÉDUCTION en amont du nettoyage : une ligne par
+       (clé, subject, jour, lieu, logique), avec le raw collecté et la fiabilité.
+       La window de clean_spikes tournera sur CE grain réduit (léger)."""
     raw_struct = F.struct("logic", "subject_id", "date", "lieu", "pays",
-                          "lat", "lon", "raw_source_id", "extras")
-
-    # grain SUBJECT : une ligne par (clé, subject, jour, lieu, logique)
-    # -> pour un même person_id, résultats distincts par subject sur une même période
-    subject_day = (silver_clean.where(F.col("quality") == "ok")
+                          "lat", "lon", "raw_source_id", "extras", "mapping_score")
+    return (silver_keyed
+        .withColumn("d", F.to_date("date", "yyyyMMdd"))
         .withColumn("raw", raw_struct)
         .join(reg, "logic")
         .groupBy("consensus_key", "subject_id", "d", "lieu", "pays", "logic")
         .agg(F.first("fiabilite").alias("w"),
              F.first("person_id", ignorenulls=True).alias("person_id"),
+             F.first("mapping_score", ignorenulls=True).alias("mapping_score"),
              F.collect_list("raw").alias("raw")))
 
-    per_logic = subject_day.select(
-        "consensus_key", "subject_id", "d", "lieu", "pays", "person_id", "logic",
+def build_daily(subject_day_clean):
+    """Consomme le grain réduit ET nettoyé (quality == ok déjà appliqué en amont).
+       Produit les lignes per-logic + les lignes consensus."""
+    per_logic = subject_day_clean.select(
+        "consensus_key", "subject_id", "d", "lieu", "pays", "person_id", "mapping_score", "logic",
         F.col("w").alias("score"),
         F.array("logic").alias("contributing_logics"),
         F.array("subject_id").alias("contributing_subjects"),
         F.lit(1).alias("n_logics"), "raw")
 
-    # grain LOGIQUE (subjects fusionnés) : sert au consensus.
-    # Une logique n'est comptée qu'UNE fois dans le noisy-OR, même portée
-    # par plusieurs subjects de la même personne (pas de double comptage).
-    logic_day = (subject_day
+    # grain LOGIQUE (subjects fusionnés) pour le consensus : une logique comptée une fois
+    logic_day = (subject_day_clean
         .groupBy("consensus_key", "d", "lieu", "pays", "logic")
         .agg(F.first("w").alias("w"),
              F.first("person_id", ignorenulls=True).alias("person_id"),
@@ -312,8 +370,12 @@ def relink(spark, J, reg):
 def ingest(spark, J, configs, reg):
     dmin = _jours_avant(J, BUFFER_JOURS)
 
-    silver = clean_spikes(add_consensus_key(spark, build_silver_raw(spark, configs, dmin, J)))
-    sortie = _forme_gold_jour(build_daily(silver, reg))
+    silver_keyed = add_consensus_key(spark, build_silver_raw(spark, configs, dmin, J))
+
+    # 1. RÉDUIRE  2. NETTOYER (window légère)  3. écarter les spikes  4. build_daily
+    subj_day = build_subject_day(silver_keyed, reg)
+    subj_ok  = clean_spikes(subj_day).where(F.col("quality") == "ok")
+    sortie   = _forme_gold_jour(build_daily(subj_ok))
 
     _ecrire_partitions(spark, sortie, GOLD_JOUR, "date")
 
@@ -326,7 +388,8 @@ def ingest(spark, J, configs, reg):
         (par_cle.sortWithinPartitions("consensus_key", "date")
             .write.mode("append").format("parquet").insertInto(GOLD_PAR_CLE))
 
-    vus = (silver.where(F.col("person_id").isNull())
+    # last_seen : calculé sur silver_keyed (date en yyyyMMdd, subjects non résolus)
+    vus = (silver_keyed.where(F.col("person_id").isNull())
         .groupBy("subject_id")
         .agg(F.min("date").alias("premiere_activite"),
              F.max("date").alias("derniere_activite")))
