@@ -1,3 +1,7 @@
+https://claude.ai/public/artifacts/5c1e49d4-26f2-4096-8331-63687a17fc60
+
+
+https://claude.ai/public/artifacts/89104e95-001e-4ca5-b037-03ca6a4833bc
 # =====================================================================
 #  PIPELINE FINAL v2 — logiques pilotées par la CONFIG JSON (Oracle CLOB)
 #  Changements vs v1 :
