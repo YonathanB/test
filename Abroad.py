@@ -567,35 +567,7 @@ def run_quotidien(spark, J, jdbc_url, jdbc_props, avec_relink=True):
 
 
 
-# =====================================================================
-#  PROJECTION gold_jour -> index Elastic (1 doc = 1 IDENTITÉ)
-#  Séjours en `nested`, contributions en objets simples dans chaque séjour.
-#  Sert la maquette v2 : ligne identité -> séjours -> contributions.
-#  Le NIVEAU BRUT n'est pas indexé (lu à la demande dans gold_jour).
-#  Les NOMS ne sont pas indexés : le front les résout via la table de personnes.
-# =====================================================================
-from pyspark.sql import functions as F, Window
-from pyspark import StorageLevel
-
-GOLD_JOUR   = "gold_jour"
-ES_INDEX    = "localisation_identites_v2_{J}"
-
-HISTORIQUE_MOIS       = 24     # profondeur indexée (gold_jour reste la vérité)
-MAX_SEJOURS           = 2000   # garde-fou par document
-FENETRE_SUBJECT_JOURS = 90     # non rattachés : seuls les actifs récents
-
-
-# ---------------------------------------------------------------------
-#  1. Séjours = îlots de jours consécutifs sur un même lieu
-# ---------------------------------------------------------------------
-def _ilots(jour, cles):
-    w = Window.partitionBy(*cles, "lieu").orderBy("d")
-    return (jour
-        .withColumn("prev", F.lag("d").over(w))
-        .withColumn("gap", F.when(
-            F.col("prev").isNull() | (F.datediff("d", "prev") > 1), 1).otherwise(0))
-        .withColumn("ilot", F.sum("gap").over(w)))
-
+# =
 
 def _base(spark, J, consensus):
     debut = F.add_months(F.to_date(F.lit(J), "yyyyMMdd"), -HISTORIQUE_MOIS)
@@ -660,6 +632,167 @@ def documents(spark, J, registre=None):
        Petit (quelques dizaines de lignes) -> broadcast sûr."""
     sej  = marquer_divergence(sejours_consensus(spark, J))
     ctrb = sejours_contributions(spark, J)
+
+    if registre is not None:
+        ctrb = ctrb.join(F.broadcast(registre), "logic", "left")
+    else:
+        ctrb = ctrb.withColumn("logic_libelle", F.col("logic"))
+
+    # rattacher chaque contribution au séjour consensus qu'elle recoupe
+    s = sej.select(
+        F.col("consensus_key").alias("s_key"), F.col("lieu").alias("s_lieu"),
+        F.col("gte_d").alias("s_gte"), F.col("lte_d").alias("s_lte"))
+    contrib_par_sejour = (ctrb.join(s,
+            (ctrb["consensus_key"] == s["s_key"]) & (ctrb["lieu"] == s["s_lieu"]) &
+            (ctrb["c_gte_d"] <= s["s_lte"]) & (s["s_gte"] <= ctrb["c_lte_d"]), "inner")
+        .groupBy("s_key", "s_lieu", "s_gte")
+        .agg(F.collect_list(F.struct(
+
+
+
+# =====================================================================
+#  PROJECTION gold_jour -> index Elastic (1 doc = 1 IDENTITÉ)
+#  Séjours en `nested`, contributions en objets simples dans chaque séjour.
+#  Sert la maquette v2 : ligne identité -> séjours -> contributions.
+#  Le NIVEAU BRUT n'est pas indexé (lu à la demande dans gold_jour).
+#  Les NOMS ne sont pas indexés : le front les résout via la table de personnes.
+# =====================================================================
+from pyspark.sql import functions as F, Window
+from pyspark import StorageLevel
+
+GOLD_JOUR   = "gold_jour"
+ES_INDEX    = "localisation_identites_v2_{J}"
+
+HISTORIQUE_MOIS       = 24     # profondeur indexée (gold_jour reste la vérité)
+MAX_SEJOURS           = 2000   # garde-fou par document
+FENETRE_SUBJECT_JOURS = 90     # non rattachés : seuls les actifs récents
+
+
+# ---------------------------------------------------------------------
+#  1. Séjours = îlots de jours consécutifs sur un même lieu
+# ---------------------------------------------------------------------
+def _ilots(jour, cles):
+    w = Window.partitionBy(*cles, "lieu").orderBy("d")
+    return (jour
+        .withColumn("prev", F.lag("d").over(w))
+        .withColumn("gap", F.when(
+            F.col("prev").isNull() | (F.datediff("d", "prev") > 1), 1).otherwise(0))
+        .withColumn("ilot", F.sum("gap").over(w)))
+
+
+def _base(spark, J, consensus):
+    debut = F.add_months(F.to_date(F.lit(J), "yyyyMMdd"), -HISTORIQUE_MOIS)
+    df = (spark.table(GOLD_JOUR)
+        .withColumn("d", F.to_date("date", "yyyyMMdd"))
+        .where(F.col("d") >= debut))
+    return df.where(F.col("logic") == "consensus") if consensus \
+        else df.where(F.col("logic") != "consensus")
+
+
+def cles_perimetre(spark, J, fenetre_jours=FENETRE_SUBJECT_JOURS):
+    """Clés à indexer : rattachées, OU actives dans la fenêtre récente.
+    Calculé EN AMONT de tout : le reste de la projection ne traite que ces clés,
+    au lieu de tout construire puis de jeter les dormantes à la fin."""
+    seuil = F.date_sub(F.to_date(F.lit(J), "yyyyMMdd"), fenetre_jours)
+    return (_base(spark, J, True)
+        .groupBy("consensus_key")
+        .agg(F.max(F.col("person_id").isNotNull()).alias("rattache"),
+             F.max("d").alias("derniere_d"))
+        .where(F.col("rattache") | (F.col("derniere_d") >= seuil))
+        .select("consensus_key"))
+
+
+def sejours_consensus(spark, J):
+    """Séjours au niveau identité : le corps de chaque séjour affiché."""
+    return (_ilots(_base(spark, J, True), ["consensus_key"])
+        .groupBy("consensus_key", "lieu", "ilot")
+        .agg(F.min("d").alias("gte_d"), F.max("d").alias("lte_d"),
+             F.first("pays").alias("pays"),
+             F.first("person_id", ignorenulls=True).alias("person_id"),
+             F.avg("score").alias("score"),
+             F.max("n_logics").alias("n_logics"),
+             F.array_distinct(F.flatten(F.collect_list("contributing_logics")))
+                 .alias("logiques"),
+             F.array_distinct(F.flatten(F.collect_list("contributing_subjects")))
+                 .alias("subjects"))
+        .withColumn("nb_jours", F.datediff("lte_d", "gte_d") + 1)
+        .drop("ilot"))
+
+
+def sejours_contributions(spark, J):
+    """Séjours au niveau logique x subject : le détail (niveau 2 de la maquette)."""
+    return (_ilots(_base(spark, J, False), ["consensus_key", "logic", "subject_id"])
+        .groupBy("consensus_key", "logic", "subject_id", "lieu", "ilot")
+        .agg(F.min("d").alias("c_gte_d"), F.max("d").alias("c_lte_d"),
+             F.avg("score").alias("c_score"),
+             F.first("mapping_score", ignorenulls=True).alias("mapping_score"))
+        .drop("ilot"))
+
+
+def sejours_consensus_filtre(spark, J, cles):
+    """Comme sejours_consensus, mais restreint aux clés du périmètre AVANT
+    les windows/groupBy : le semi-join coûte un shuffle léger et évite de
+    calculer des îlots pour des millions d'identités jetées ensuite."""
+    base = _base(spark, J, True).join(cles, "consensus_key", "left_semi")
+    return (_ilots(base, ["consensus_key"])
+        .groupBy("consensus_key", "lieu", "ilot")
+        .agg(F.min("d").alias("gte_d"), F.max("d").alias("lte_d"),
+             F.first("pays").alias("pays"),
+             F.first("person_id", ignorenulls=True).alias("person_id"),
+             F.avg("score").alias("score"),
+             F.max("n_logics").alias("n_logics"),
+             F.array_distinct(F.flatten(F.collect_list("contributing_logics")))
+                 .alias("logiques"),
+             F.array_distinct(F.flatten(F.collect_list("contributing_subjects")))
+                 .alias("subjects"))
+        .withColumn("nb_jours", F.datediff("lte_d", "gte_d") + 1)
+        .drop("ilot"))
+
+
+def sejours_contributions_filtre(spark, J, cles):
+    base = _base(spark, J, False).join(cles, "consensus_key", "left_semi")
+    return (_ilots(base, ["consensus_key", "logic", "subject_id"])
+        .groupBy("consensus_key", "logic", "subject_id", "lieu", "ilot")
+        .agg(F.min("d").alias("c_gte_d"), F.max("d").alias("c_lte_d"),
+             F.avg("score").alias("c_score"),
+             F.first("mapping_score", ignorenulls=True).alias("mapping_score"))
+        .drop("ilot"))
+
+
+# ---------------------------------------------------------------------
+#  2. Divergence : deux séjours simultanés sur des lieux différents
+#     Par WINDOW (balayage), pas par self-join : le self-join sur
+#     consensus_key était quadratique et dominait le temps de projection.
+#     Deux séjours d'un même lieu ne peuvent pas se chevaucher (îlots),
+#     donc chevauchement => lieux différents : pas besoin de tester le lieu.
+# ---------------------------------------------------------------------
+def marquer_divergence(sej):
+    wk = Window.partitionBy("consensus_key").orderBy("gte_d", "lte_d")
+    w_prev = wk.rowsBetween(Window.unboundedPreceding, -1)
+    w_next = wk.rowsBetween(1, Window.unboundedFollowing)
+    return (sej
+        .withColumn("max_lte_avant", F.max("lte_d").over(w_prev))
+        .withColumn("min_gte_apres", F.min("gte_d").over(w_next))
+        .withColumn("divergence",
+            (F.col("gte_d") <= F.col("max_lte_avant")) |          # recouvre un précédent
+            (F.col("min_gte_apres") <= F.col("lte_d")))           # recouvert par un suivant
+        .withColumn("divergence", F.coalesce("divergence", F.lit(False)))
+        .drop("max_lte_avant", "min_gte_apres"))
+
+
+# ---------------------------------------------------------------------
+#  3. Assemblage : 1 ligne = 1 identité
+# ---------------------------------------------------------------------
+def documents(spark, J, registre=None):
+    """registre : DataFrame (logic, logic_libelle) issu de la config Oracle.
+       Petit (quelques dizaines de lignes) -> broadcast sûr."""
+    # PÉRIMÈTRE D'ABORD : tout le calcul (îlots, divergence, contributions)
+    # ne porte que sur les clés à indexer. Les subjects dormants sont écartés
+    # ici, pas après avoir tout construit.
+    cles = cles_perimetre(spark, J)
+    sej  = marquer_divergence(
+        sejours_consensus_filtre(spark, J, cles))
+    ctrb = sejours_contributions_filtre(spark, J, cles)
 
     if registre is not None:
         ctrb = ctrb.join(F.broadcast(registre), "logic", "left")
@@ -757,7 +890,9 @@ def controle_volumetrie(docs):
 
 
 def projeter(spark, J, registre=None, noeuds="localhost"):
-    docs = restreindre_perimetre(documents(spark, J, registre), J)
+    # le périmètre est appliqué EN TÊTE de documents() (cles_perimetre) ;
+    # plus de filtre tardif ici.
+    docs = documents(spark, J, registre)
     docs.persist(StorageLevel.MEMORY_AND_DISK)
     controle_volumetrie(docs).show()
     ecrire_elastic(docs, ES_INDEX.format(J=J), noeuds)
@@ -766,3 +901,5 @@ def projeter(spark, J, registre=None, noeuds="localhost"):
     #   POST /_aliases {"actions":[
     #     {"remove":{"index":"localisation_identites_v2_*","alias":"localisation"}},
     #     {"add":{"index":"localisation_identites_v2_<J>","alias":"localisation"}}]}
+
+
