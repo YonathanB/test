@@ -1,187 +1,4 @@
-https://claude.ai/public/artifacts/5c1e49d4-26f2-4096-8331-63687a17fc60
 
-
-https://claude.ai/public/artifacts/89104e95-001e-4ca5-b037-03ca6a4833bc
-
-
-# =====================================================================
-#  PROJECTION gold_jour -> index Elastic `localisation_sejours`
-#  Grain du document : 1 SÉJOUR (consensus), contributions en nested.
-#  Sert la maquette v2 : ligne identité -> séjours -> contributions.
-#  Le NIVEAU BRUT n'est pas indexé (lu à la demande dans gold_jour).
-# =====================================================================
-from pyspark.sql import functions as F, Window
-
-GOLD_JOUR      = "gold_jour"
-ES_RESOURCE    = "localisation_sejours_{J}"      # index daté, alias basculé après
-ES_IDENTITES   = "localisation_identites_{J}"
-FENETRE_SUBJECT_JOURS = 90     # subjects non rattachés : seuls les récents sont indexés
-
-
-# ---------------------------------------------------------------------
-#  1. Séjours (îlots de jours consécutifs sur un même lieu)
-# ---------------------------------------------------------------------
-def _sejours(jour, cle_partition):
-    """Regroupe des jours consécutifs au même lieu en un séjour.
-    cle_partition : colonnes définissant la trajectoire à découper."""
-    w = Window.partitionBy(*cle_partition, "lieu").orderBy("d")
-    islands = (jour
-        .withColumn("prev", F.lag("d").over(w))
-        .withColumn("gap", F.when(
-            F.col("prev").isNull() | (F.datediff("d", "prev") > 1), 1).otherwise(0))
-        .withColumn("island_id", F.sum("gap").over(w)))
-    return islands
-
-
-def sejours_consensus(spark, J):
-    """Séjours au niveau IDENTITÉ (lignes consensus) -> le corps du document."""
-    base = (spark.table(GOLD_JOUR)
-        .where(F.col("logic") == "consensus")
-        .withColumn("d", F.to_date("date", "yyyyMMdd")))
-
-    return (_sejours(base, ["consensus_key"])
-        .groupBy("consensus_key", "lieu", "island_id")
-        .agg(F.min("d").alias("gte_d"), F.max("d").alias("lte_d"),
-             F.first("pays").alias("pays"),
-             F.first("person_id", ignorenulls=True).alias("person_id"),
-             F.avg("score").alias("score"),
-             F.max("n_logics").alias("n_logics"),
-             F.array_distinct(F.flatten(F.collect_list("contributing_logics")))
-                 .alias("contributing_logics"),
-             F.array_distinct(F.flatten(F.collect_list("contributing_subjects")))
-                 .alias("contributing_subjects"))
-        .withColumn("nb_jours", F.datediff("lte_d", "gte_d") + 1)
-        .drop("island_id"))
-
-
-def sejours_contributions(spark, J):
-    """Séjours au niveau LOGIQUE x SUBJECT -> le bloc `contributions` (nested)."""
-    base = (spark.table(GOLD_JOUR)
-        .where(F.col("logic") != "consensus")
-        .withColumn("d", F.to_date("date", "yyyyMMdd")))
-
-    return (_sejours(base, ["consensus_key", "logic", "subject_id"])
-        .groupBy("consensus_key", "logic", "subject_id", "lieu", "island_id")
-        .agg(F.min("d").alias("c_gte_d"), F.max("d").alias("c_lte_d"),
-             F.avg("score").alias("c_score"),
-             F.first("mapping_score", ignorenulls=True).alias("mapping_score"))
-        .drop("island_id"))
-
-
-# ---------------------------------------------------------------------
-#  2. Divergence : deux séjours de la même identité qui se chevauchent
-#     sur des lieux différents (barres basses de la frise)
-# ---------------------------------------------------------------------
-def marquer_divergence(sej):
-    a = sej.alias("a")
-    b = (sej.select("consensus_key", "lieu", "gte_d", "lte_d")
-            .withColumnRenamed("lieu", "b_lieu")
-            .withColumnRenamed("gte_d", "b_gte")
-            .withColumnRenamed("lte_d", "b_lte").alias("b"))
-    chevauche = (a.join(b, "consensus_key", "inner")
-        .where((F.col("lieu") != F.col("b_lieu")) &
-               (F.col("gte_d") <= F.col("b_lte")) &
-               (F.col("b_gte") <= F.col("lte_d")))
-        .select("consensus_key", "lieu", "gte_d").distinct()
-        .withColumn("divergence", F.lit(True)))
-    return (sej.join(F.broadcast(chevauche),
-                     ["consensus_key", "lieu", "gte_d"], "left")
-               .withColumn("divergence", F.coalesce("divergence", F.lit(False))))
-
-
-# ---------------------------------------------------------------------
-#  3. Assemblage du document
-# ---------------------------------------------------------------------
-def documents_sejours(spark, J, libelles=None, registre=None):
-    """libelles : DataFrame (consensus_key, libelle) — noms lisibles.
-       registre : DataFrame (logic, logic_libelle) — issu de la config Oracle."""
-    sej  = marquer_divergence(sejours_consensus(spark, J))
-    ctrb = sejours_contributions(spark, J)
-
-    if registre is not None:
-        ctrb = ctrb.join(F.broadcast(registre), "logic", "left")
-    else:
-        ctrb = ctrb.withColumn("logic_libelle", F.col("logic"))
-
-    # une contribution est rattachée au séjour consensus qu'elle recoupe
-    ctrb_group = (ctrb.join(
-            sej.select("consensus_key", "lieu", "gte_d", "lte_d"),
-            (ctrb.consensus_key == sej.consensus_key) &
-            (ctrb.lieu == sej.lieu) &
-            (ctrb.c_gte_d <= sej.lte_d) & (sej.gte_d <= ctrb.c_lte_d),
-            "inner")
-        .groupBy(sej.consensus_key, sej.lieu, sej.gte_d)
-        .agg(F.collect_list(F.struct(
-            F.col("logic"), F.col("logic_libelle"), F.col("subject_id"),
-            F.col("mapping_score"),
-            F.date_format("c_gte_d", "yyyyMMdd").alias("gte"),
-            F.date_format("c_lte_d", "yyyyMMdd").alias("lte"),
-            F.struct(F.date_format("c_gte_d", "yyyyMMdd").alias("gte"),
-                     F.date_format("c_lte_d", "yyyyMMdd").alias("lte")).alias("periode"),
-            F.col("c_score").alias("score"))).alias("contributions")))
-
-    doc = (sej.join(ctrb_group, ["consensus_key", "lieu", "gte_d"], "left")
-        .withColumn("gte", F.date_format("gte_d", "yyyyMMdd"))
-        .withColumn("lte", F.date_format("lte_d", "yyyyMMdd"))
-        .withColumn("periode", F.struct(F.col("gte"), F.col("lte")))
-        .withColumn("est_rattache", F.col("person_id").isNotNull())
-        .withColumn("subject_id",
-                    F.when(F.col("person_id").isNull(), F.col("consensus_key")))
-        .withColumn("doc_id", F.concat_ws("_", "consensus_key", "lieu", "gte")))
-
-    if libelles is not None:
-        doc = doc.join(F.broadcast(libelles), "consensus_key", "left")
-    doc = doc.withColumn("libelle", F.coalesce("libelle", F.col("consensus_key")))
-
-    return doc.select(
-        "doc_id", "consensus_key", "person_id", "subject_id", "est_rattache",
-        "libelle", "lieu", "pays", "periode", "gte", "lte", "nb_jours",
-        "score", "n_logics", "divergence",
-        "contributing_logics", "contributing_subjects",
-        F.coalesce("contributions", F.array()).alias("contributions"))
-
-
-def documents_identites(docs):
-    """Index léger d'autocomplétion : 1 doc par identité."""
-    return (docs.groupBy("consensus_key", "libelle", "est_rattache")
-        .agg(F.max("lte").alias("derniere_activite"),
-             F.count(F.lit(1)).alias("nb_sejours"),
-             F.max("score").alias("note_max")))
-
-
-# ---------------------------------------------------------------------
-#  4. Périmètre + écriture
-# ---------------------------------------------------------------------
-def restreindre_perimetre(docs, J, fenetre_jours=FENETRE_SUBJECT_JOURS):
-    """Rattachés : tout. Non rattachés : seulement les actifs récents.
-    Évite d'indexer 600M de subjects dormants."""
-    seuil = F.date_format(F.date_sub(F.to_date(F.lit(J), "yyyyMMdd"),
-                                     fenetre_jours), "yyyyMMdd")
-    return docs.where(F.col("est_rattache") | (F.col("lte") >= seuil))
-
-
-def ecrire_elastic(df, index, noeuds="localhost", port="9200", id_field="doc_id"):
-    (df.write.format("org.elasticsearch.spark.sql")
-       .option("es.nodes", noeuds)
-       .option("es.port", port)
-       .option("es.mapping.id", id_field)
-       .option("es.write.operation", "index")
-       .option("es.nodes.wan.only", "true")
-       .mode("overwrite")
-       .save(index))
-
-
-def projeter(spark, J, libelles=None, registre=None, noeuds="localhost"):
-    docs = restreindre_perimetre(documents_sejours(spark, J, libelles, registre), J)
-    docs.persist()
-    ecrire_elastic(docs, ES_RESOURCE.format(J=J), noeuds)
-    ecrire_elastic(documents_identites(docs), ES_IDENTITES.format(J=J),
-                   noeuds, id_field="consensus_key")
-    docs.unpersist()
-    # puis, hors Spark : basculer les alias et supprimer les index de la veille
-    #   POST /_aliases {"actions":[
-    #     {"remove":{"index":"localisation_sejours_*","alias":"localisation_sejours"}},
-    #     {"add":{"index":"localisation_sejours_<J>","alias":"localisation_sejours"}}]}
 
 # =====================================================================
 #  PIPELINE FINAL v2 — logiques pilotées par la CONFIG JSON (Oracle CLOB)
@@ -201,7 +18,8 @@ from pyspark.sql.utils import AnalysisException
 # ---------------------------------------------------------------------
 TTL_MOIS       = 6
 BUFFER_JOURS   = 3
-N_BUCKETS      = 8192
+N_BUCKETS      = 1024      # 8192 était surdimensionné : autant de fichiers à committer
+AVEC_PAR_CLE   = False     # table d'accès par identifiant : désactivée (cf. ingest)
 CLAMP_FIAB     = 0.999999          # évite log(0) quand fiabilite = 1.0
 
 GOLD_JOUR      = "gold_jour"
@@ -398,7 +216,7 @@ def clean_spikes(subject_day):
 
     # 3. re-marquage des lignes d'origine (jour entier de la personne flagué)
     return (subject_day
-        .join(F.broadcast(spikes), ["consensus_key", "d"], "left")
+        .join(spikes, ["consensus_key", "d"], "left")
         .withColumn("quality", F.when(F.col("est_spike"), F.lit("spike"))
                                 .otherwise(F.lit("ok")))
         .drop("est_spike"))
@@ -438,7 +256,10 @@ def _consensus_depuis_logic_day(logic_day):
              F.first("person_id", ignorenulls=True).alias("person_id"),
              F.flatten(F.collect_list("raw")).alias("raw"))
         .withColumn("logic", F.lit("consensus"))
-        .withColumn("subject_id", F.lit(None).cast("string")))   # consensus = niveau personne
+        .withColumn("subject_id", F.lit(None).cast("string"))     # consensus = niveau personne
+        # mapping_score = note du lien subject->person : n'a pas de sens au niveau
+        # personne (plusieurs subjects possibles) -> null sur les lignes consensus.
+        .withColumn("mapping_score", F.lit(None).cast("double")))
 
 def build_subject_day(silver_keyed, reg):
     """RÉDUCTION en amont du nettoyage : une ligne par
@@ -480,7 +301,7 @@ def _forme_gold_jour(daily):
     return (daily
         .withColumn("date", F.date_format("d", "yyyyMMdd"))
         .select("consensus_key", "person_id", "subject_id", "lieu", "pays", "logic",
-                "score", "contributing_logics", "contributing_subjects",
+                "score", "mapping_score", "contributing_logics", "contributing_subjects",
                 "n_logics", "raw", "date"))
 
 
@@ -564,14 +385,20 @@ def ingest(spark, J, configs, reg):
 
     _ecrire_partitions(spark, sortie, GOLD_JOUR, "date")
 
-    par_cle = sortie.withColumn("bucket",
-        F.pmod(F.hash("consensus_key"), F.lit(N_BUCKETS)))
-    if not _table_existe(spark, GOLD_PAR_CLE):
-        (par_cle.sortWithinPartitions("consensus_key", "date")
-            .write.format("parquet").partitionBy("bucket").saveAsTable(GOLD_PAR_CLE))
-    else:
-        (par_cle.sortWithinPartitions("consensus_key", "date")
-            .write.mode("append").format("parquet").insertInto(GOLD_PAR_CLE))
+    # Table d'accès par identifiant : MÊME donnée que gold_jour, seul le
+    # partitionnement change (bucket au lieu de date). Désactivée par défaut :
+    # coûte une 2e écriture complète/jour, dont un commit driver très long
+    # (partitionBy sur N_BUCKETS -> multitude de petits fichiers).
+    # À réactiver quand la recherche "identifiant sans plage de dates" sera un vrai besoin.
+    if AVEC_PAR_CLE:
+        par_cle = sortie.withColumn("bucket",
+            F.pmod(F.hash("consensus_key"), F.lit(N_BUCKETS)))
+        # repartition("bucket") : 1 tâche par bucket -> N_BUCKETS fichiers, pas 100k.
+        par_cle = par_cle.repartition("bucket").sortWithinPartitions("consensus_key", "date")
+        if not _table_existe(spark, GOLD_PAR_CLE):
+            par_cle.write.format("parquet").partitionBy("bucket").saveAsTable(GOLD_PAR_CLE)
+        else:
+            par_cle.write.mode("append").format("parquet").insertInto(GOLD_PAR_CLE)
 
     # last_seen : calculé sur silver_keyed (date en yyyyMMdd, subjects non résolus)
     vus = (silver_keyed.where(F.col("person_id").isNull())
@@ -728,9 +555,214 @@ def run_quotidien(spark, J, jdbc_url, jdbc_props, avec_relink=True):
         relink(spark, J, reg)          #    (peut être planifiée moins souvent / à la demande)
     ingest(spark, J, configs, reg)     # 2. le jour (tampon)
     purge(spark, J)                    # 3. faucher en dernier
-    build_gold_personnes(spark)        # 4. la vue personnes
+    # 4. la couche de service est désormais l'index Elastic :
+    #    projection_elastic.projeter(spark, J, registre=reg.select("logic","logic_libelle"))
+    #    (gold_personnes retirée du run : doublon avec la projection — code conservé
+    #     plus bas si un besoin hors-Elastic réapparaît)
 
 # run_quotidien(spark, "20240320",
 #     jdbc_url="jdbc:oracle:thin:@//host:1521/service",
 #     jdbc_props={"user": "...", "password": "...",
 #                 "driver": "oracle.jdbc.OracleDriver"})
+
+
+
+# =====================================================================
+#  PROJECTION gold_jour -> index Elastic (1 doc = 1 IDENTITÉ)
+#  Séjours en `nested`, contributions en objets simples dans chaque séjour.
+#  Sert la maquette v2 : ligne identité -> séjours -> contributions.
+#  Le NIVEAU BRUT n'est pas indexé (lu à la demande dans gold_jour).
+#  Les NOMS ne sont pas indexés : le front les résout via la table de personnes.
+# =====================================================================
+from pyspark.sql import functions as F, Window
+from pyspark import StorageLevel
+
+GOLD_JOUR   = "gold_jour"
+ES_INDEX    = "localisation_identites_v2_{J}"
+
+HISTORIQUE_MOIS       = 24     # profondeur indexée (gold_jour reste la vérité)
+MAX_SEJOURS           = 2000   # garde-fou par document
+FENETRE_SUBJECT_JOURS = 90     # non rattachés : seuls les actifs récents
+
+
+# ---------------------------------------------------------------------
+#  1. Séjours = îlots de jours consécutifs sur un même lieu
+# ---------------------------------------------------------------------
+def _ilots(jour, cles):
+    w = Window.partitionBy(*cles, "lieu").orderBy("d")
+    return (jour
+        .withColumn("prev", F.lag("d").over(w))
+        .withColumn("gap", F.when(
+            F.col("prev").isNull() | (F.datediff("d", "prev") > 1), 1).otherwise(0))
+        .withColumn("ilot", F.sum("gap").over(w)))
+
+
+def _base(spark, J, consensus):
+    debut = F.add_months(F.to_date(F.lit(J), "yyyyMMdd"), -HISTORIQUE_MOIS)
+    df = (spark.table(GOLD_JOUR)
+        .withColumn("d", F.to_date("date", "yyyyMMdd"))
+        .where(F.col("d") >= debut))
+    return df.where(F.col("logic") == "consensus") if consensus \
+        else df.where(F.col("logic") != "consensus")
+
+
+def sejours_consensus(spark, J):
+    """Séjours au niveau identité : le corps de chaque séjour affiché."""
+    return (_ilots(_base(spark, J, True), ["consensus_key"])
+        .groupBy("consensus_key", "lieu", "ilot")
+        .agg(F.min("d").alias("gte_d"), F.max("d").alias("lte_d"),
+             F.first("pays").alias("pays"),
+             F.first("person_id", ignorenulls=True).alias("person_id"),
+             F.avg("score").alias("score"),
+             F.max("n_logics").alias("n_logics"),
+             F.array_distinct(F.flatten(F.collect_list("contributing_logics")))
+                 .alias("logiques"),
+             F.array_distinct(F.flatten(F.collect_list("contributing_subjects")))
+                 .alias("subjects"))
+        .withColumn("nb_jours", F.datediff("lte_d", "gte_d") + 1)
+        .drop("ilot"))
+
+
+def sejours_contributions(spark, J):
+    """Séjours au niveau logique x subject : le détail (niveau 2 de la maquette)."""
+    return (_ilots(_base(spark, J, False), ["consensus_key", "logic", "subject_id"])
+        .groupBy("consensus_key", "logic", "subject_id", "lieu", "ilot")
+        .agg(F.min("d").alias("c_gte_d"), F.max("d").alias("c_lte_d"),
+             F.avg("score").alias("c_score"),
+             F.first("mapping_score", ignorenulls=True).alias("mapping_score"))
+        .drop("ilot"))
+
+
+# ---------------------------------------------------------------------
+#  2. Divergence : deux séjours simultanés sur des lieux différents
+# ---------------------------------------------------------------------
+def marquer_divergence(sej):
+    b = sej.select(
+            F.col("consensus_key").alias("k2"),
+            F.col("lieu").alias("b_lieu"),
+            F.col("gte_d").alias("b_gte"),
+            F.col("lte_d").alias("b_lte"))
+    chevauche = (sej.join(b, sej["consensus_key"] == b["k2"], "inner")
+        .where((F.col("lieu") != F.col("b_lieu")) &
+               (F.col("gte_d") <= F.col("b_lte")) &
+               (F.col("b_gte") <= F.col("lte_d")))
+        .select("consensus_key", "lieu", "gte_d").distinct()
+        .withColumn("divergence", F.lit(True)))
+    return (sej.join(chevauche, ["consensus_key", "lieu", "gte_d"], "left")
+               .withColumn("divergence", F.coalesce("divergence", F.lit(False))))
+
+
+# ---------------------------------------------------------------------
+#  3. Assemblage : 1 ligne = 1 identité
+# ---------------------------------------------------------------------
+def documents(spark, J, registre=None):
+    """registre : DataFrame (logic, logic_libelle) issu de la config Oracle.
+       Petit (quelques dizaines de lignes) -> broadcast sûr."""
+    sej  = marquer_divergence(sejours_consensus(spark, J))
+    ctrb = sejours_contributions(spark, J)
+
+    if registre is not None:
+        ctrb = ctrb.join(F.broadcast(registre), "logic", "left")
+    else:
+        ctrb = ctrb.withColumn("logic_libelle", F.col("logic"))
+
+    # rattacher chaque contribution au séjour consensus qu'elle recoupe
+    s = sej.select(
+        F.col("consensus_key").alias("s_key"), F.col("lieu").alias("s_lieu"),
+        F.col("gte_d").alias("s_gte"), F.col("lte_d").alias("s_lte"))
+    contrib_par_sejour = (ctrb.join(s,
+            (ctrb["consensus_key"] == s["s_key"]) & (ctrb["lieu"] == s["s_lieu"]) &
+            (ctrb["c_gte_d"] <= s["s_lte"]) & (s["s_gte"] <= ctrb["c_lte_d"]), "inner")
+        .groupBy("s_key", "s_lieu", "s_gte")
+        .agg(F.collect_list(F.struct(
+                "logic", "logic_libelle", "subject_id", "mapping_score",
+                F.date_format("c_gte_d", "yyyyMMdd").alias("gte"),
+                F.date_format("c_lte_d", "yyyyMMdd").alias("lte"),
+                F.col("c_score").alias("score"))).alias("contributions")))
+
+    # 1 ligne par séjour, contributions incluses
+    sejour_complet = (sej.join(contrib_par_sejour,
+            (sej["consensus_key"] == contrib_par_sejour["s_key"]) &
+            (sej["lieu"] == contrib_par_sejour["s_lieu"]) &
+            (sej["gte_d"] == contrib_par_sejour["s_gte"]), "left")
+        .drop("s_key", "s_lieu", "s_gte")
+        .withColumn("gte", F.date_format("gte_d", "yyyyMMdd"))
+        .withColumn("lte", F.date_format("lte_d", "yyyyMMdd")))
+
+    # 1 ligne par IDENTITÉ : les séjours deviennent un tableau nested.
+    # gte en tête du struct -> sort_array trie les séjours chronologiquement.
+    sejour_struct = F.struct(
+        F.col("gte"), F.col("lte"), "lieu", "pays",
+        F.struct(F.col("gte").alias("gte"), F.col("lte").alias("lte")).alias("periode"),
+        "nb_jours", "score", "n_logics", "divergence",
+        F.coalesce("contributions", F.array()).alias("contributions"))
+
+    return (sejour_complet
+        .groupBy("consensus_key")
+        .agg(F.first("person_id", ignorenulls=True).alias("person_id"),
+             F.min("gte").alias("premiere_activite"),
+             F.max("lte").alias("derniere_activite"),
+             F.max("score").alias("note_max"),
+             F.count(F.lit(1)).alias("nb_sejours"),
+             F.array_distinct(F.collect_list("lieu")).alias("lieux"),
+             F.array_distinct(F.flatten(F.collect_list("logiques"))).alias("logiques"),
+             F.array_distinct(F.flatten(F.collect_list("subjects"))).alias("subjects"),
+             F.sort_array(F.collect_list(sejour_struct)).alias("sejours"))
+        .withColumn("est_rattache", F.col("person_id").isNotNull())
+        .withColumn("subject_id",
+                    F.when(F.col("person_id").isNull(), F.col("consensus_key")))
+        .withColumn("periode_couverte",
+                    F.struct(F.col("premiere_activite").alias("gte"),
+                             F.col("derniere_activite").alias("lte")))
+        # garde-fou : un document pathologique ne doit pas faire sauter l'indexation
+        .withColumn("sejours", F.slice(F.col("sejours"), 1, MAX_SEJOURS))
+        .select("consensus_key", "person_id", "subject_id", "est_rattache",
+                "premiere_activite", "derniere_activite", "periode_couverte",
+                "note_max", "nb_sejours", "lieux", "logiques", "subjects", "sejours"))
+
+
+# ---------------------------------------------------------------------
+#  4. Périmètre + écriture
+# ---------------------------------------------------------------------
+def restreindre_perimetre(docs, J, fenetre_jours=FENETRE_SUBJECT_JOURS):
+    """Rattachés : tout. Non rattachés : seulement les actifs récents,
+    sinon les subjects dormants font exploser le volume de l'index."""
+    seuil = F.date_format(
+        F.date_sub(F.to_date(F.lit(J), "yyyyMMdd"), fenetre_jours), "yyyyMMdd")
+    return docs.where(F.col("est_rattache") | (F.col("derniere_activite") >= seuil))
+
+
+def ecrire_elastic(df, index, noeuds="localhost", port="9200"):
+    (df.write.format("org.elasticsearch.spark.sql")
+       .option("es.nodes", noeuds)
+       .option("es.port", port)
+       .option("es.mapping.id", "consensus_key")
+       .option("es.write.operation", "index")
+       .option("es.nodes.wan.only", "true")
+       .option("es.batch.size.bytes", "5mb")
+       .option("es.batch.size.entries", "500")     # docs plus gros qu'au grain séjour
+       .option("es.batch.write.retry.count", "6")
+       .option("es.batch.write.retry.wait", "30s")
+       .mode("overwrite")
+       .save(index))
+
+
+def controle_volumetrie(docs):
+    """À lancer au 1er run : dimensionner l'index avant de le construire en entier."""
+    return docs.select(
+        F.count(F.lit(1)).alias("nb_documents"),
+        F.sum(F.col("est_rattache").cast("int")).alias("nb_rattaches"),
+        F.avg(F.size("sejours")).alias("sejours_moyen"),
+        F.max(F.size("sejours")).alias("sejours_max"))
+
+
+def projeter(spark, J, registre=None, noeuds="localhost"):
+    docs = restreindre_perimetre(documents(spark, J, registre), J)
+    docs.persist(StorageLevel.MEMORY_AND_DISK)
+    controle_volumetrie(docs).show()
+    ecrire_elastic(docs, ES_INDEX.format(J=J), noeuds)
+    docs.unpersist()
+    # puis, hors Spark : bascule d'alias
+    #   POST /_aliases {"actions":[
+    #     {"remove":{"index":"localisation_identites_v2_*","alias":"localisation"}},
+    #     {"add":{"index":"localisation_identites_v2_<J>","alias":"localisation"}}]}
