@@ -1,0 +1,253 @@
+# Prompt — Génération du pipeline Spark V1
+
+> À copier tel quel dans un LLM. Tout ce qui suit est la spécification.
+
+---
+
+Tu dois écrire un pipeline PySpark complet et fonctionnel. Respecte la spécification à la lettre : chaque règle a une raison, ne simplifie pas, ne renomme pas les colonnes.
+
+## Contexte
+
+Une plateforme consolide, à partir de plusieurs tables sources hétérogènes, la liste des pays dans lesquels des personnes ont séjourné à chaque date. Les sources se contredisent, sont de fiabilité inégale, et leurs identifiants ne correspondent pas toujours à une personne connue. Le résultat doit être **explicable** : chaque décision doit pouvoir être remontée jusqu'à la ligne d'origine.
+
+## Stack imposée
+
+- PySpark 3.5, tables **Apache Iceberg**, fichiers **ORC**
+- Écriture incrémentale par `INSERT OVERWRITE` sur plage de partitions (jamais de réécriture globale)
+- Aucune constante en dur : tous les seuils viennent d'un fichier de configuration
+- Code en Python, commentaires en français
+
+## Architecture générale
+
+```
+Tables sources (externes, pérennes, non copiées)
+        ↓  job 1 : normalisation
+silver_events              persistant, partition event_date, bucket entity_key
+        ↓  job 2 : consolidation par source
+hyp_source                 partition event_date, bucket entity_key
+        ↓  job 3 : convergence entre sources
+hyp_finale                 partition event_date, bucket entity_key
+        ↓  job 4 : décision du jour
+position_quotidienne       partition event_date, bucket entity_key
+        ↓  job 5 : segmentation
+intervalle_sejour          partition mois de date_debut, bucket entity_key
+```
+
+Le nombre de buckets est identique partout (paramètre, défaut 1024) : c'est ce qui rend les jointures entre étages co-localisées.
+
+Il n'y a **pas de couche Bronze** : les tables sources sont sous la responsabilité de leurs producteurs, on les lit directement.
+
+---
+
+## Configuration
+
+### Fiche par source (JSON, un fichier par source)
+
+```json
+{
+  "source_id": "src_airline",
+  "table": "db.vols",
+  "id_column": "passport_no",
+  "id_namespace": "passport",
+  "mapping_id": "map_passport",
+  "date_column": "flight_date",
+  "date_format": "dd/MM/yyyy",
+  "country_column": "arrival_country",
+  "manual_score": 0.85,
+  "late_buffer_days": 2
+}
+```
+
+`id_namespace` est **critique** : il déclare la nature de l'identifiant (numéro de passeport, référence client…). Deux sources qui déclarent le même espace ont des identifiants comparables — c'est ce qui permet à leurs observations non résolues de se rejoindre.
+
+### Paramètres moteur (JSON unique)
+
+```json
+{
+  "params_version": "v1",
+  "buckets": 1024,
+  "volume_boost": {"alpha": 0.1, "cap": 1.3},
+  "seuils": {
+    "score_min": 0.15,
+    "ecart_contradiction": 0.15,
+    "ecart_incertain": 0.30,
+    "score_probable": 0.45,
+    "score_confirme": 0.60
+  },
+  "gap_max_days": 2,
+  "unresolved_confidence": 0.75
+}
+```
+
+### Tables de référence
+
+- `ref_countries(match_value, iso3)` — normalisation des libellés et codes pays vers ISO3
+- `ref_mappings(mapping_id, raw_identifier, person_id, confidence)` — traduction identifiant → personne
+
+---
+
+## Job 1 — silver_events
+
+Lit chaque table source selon sa fiche, produit une ligne par observation.
+
+**Colonnes de sortie**
+
+| Colonne | Contenu |
+|---|---|
+| `event_id` | `sha2(source_id + raw_identifier + raw_date + raw_country)` |
+| `source_id` | identifiant de la source |
+| `raw_identifier`, `raw_date`, `raw_country` | valeurs **telles que fournies**, avant normalisation |
+| `entity_key` | voir ci-dessous |
+| `resolved` | booléen |
+| `event_date` | date convertie via `date_format` |
+| `country_iso` | ISO3, ou `null` si non reconnu |
+| `score_source` | `manual_score` de la fiche |
+| `score_mapping` | voir ci-dessous |
+| `score_brut` | `score_source × score_mapping` |
+
+**Résolution d'identité — règles impératives**
+
+1. Normaliser l'identifiant : `upper(trim(...))`.
+2. Jointure avec `ref_mappings` sur `mapping_id` et l'identifiant normalisé.
+3. **Si trouvé** : `entity_key = person_id`, `resolved = true`, `score_mapping = confidence`.
+4. **Si non trouvé** : `entity_key = concat('UNR-', sha2(id_namespace + identifiant_normalisé))`, `resolved = false`, `score_mapping = unresolved_confidence`.
+
+Deux points sur lesquels tu ne dois pas dévier :
+
+- La clé non résolue se construit sur **`id_namespace`, jamais sur `source_id`**. C'est ce qui permet à deux sources différentes de converger sur un même identifiant inconnu.
+- `score_mapping` d'un non-résolu vaut `unresolved_confidence`, **jamais 0**. Un zéro annulerait le score brut et rendrait l'entité inexploitable.
+
+**Pays non reconnu** : conserver la ligne avec `country_iso = null`. Elle ne produira pas d'hypothèse en aval, mais reste consultable.
+
+**Incrémental** : ne lire que les partitions sources correspondant aux dates du batch, élargies de `late_buffer_days`. Écrire par `INSERT OVERWRITE` sur ces partitions.
+
+---
+
+## Job 2 — hyp_source
+
+Résume ce que dit **chaque source prise isolément**. Ne lit que `silver_events`, ignore les lignes sans `country_iso`.
+
+**Grain** : `entity_key × event_date × source_id × country_iso`
+
+| Colonne | Calcul |
+|---|---|
+| `nb_obs` | nombre d'observations |
+| `score_moyen` | moyenne des `score_brut` |
+| `coherence_interne` | somme des `score_brut` de ce pays ÷ somme sur tous les pays de la même source, même entité, même jour |
+| `boost_volume` | `min(cap, 1 + alpha × log2(nb_obs))` |
+| `score_hypothese` | `min(1.0, score_moyen × coherence_interne × boost_volume)` |
+| `event_ids` | tableau des `event_id` contributeurs |
+
+`coherence_interne` mesure si la source est d'accord avec elle-même : 1.0 si elle ne dit qu'un pays, réparti sinon.
+
+`boost_volume` est plafonné : mille observations identiques ne valent pas mille confirmations. Avec une seule observation, `log2(1) = 0` donc le boost vaut 1 (neutre).
+
+---
+
+## Job 3 — hyp_finale
+
+Combine les avis des différentes sources.
+
+**Grain** : `entity_key × event_date × country_iso`
+
+| Colonne | Calcul |
+|---|---|
+| `score_final` | `1 − ∏(1 − score_hypothese_i)` sur toutes les sources soutenant ce pays |
+| `nb_sources` | nombre de sources favorables |
+| `sources_pour` | tableau des `source_id` favorables |
+| `sources_contre` | tableau des `source_id` soutenant un **autre** pays, même entité, même jour |
+| `rang` | rang par `score_final` décroissant, départage par `country_iso` croissant |
+
+La formule noisy-OR fait monter la confiance à chaque source supplémentaire, avec un rendement décroissant, sans jamais atteindre 1.
+
+Implémentation de la formule en Spark : `1 - exp(sum(log(1 - least(score, 0.999999))))`.
+
+`sources_contre` demande une auto-jointure de la table sur `entity_key + event_date` avec `country_iso` différent.
+
+---
+
+## Job 4 — position_quotidienne
+
+Tranche entre les pays candidats.
+
+**Grain** : `entity_key × event_date`
+
+| Colonne | Calcul |
+|---|---|
+| `pays_retenu` | `country_iso` du rang 1 |
+| `confiance` | son `score_final` |
+| `pays_second` | `country_iso` du rang 2, ou `null` |
+| `ecart` | `confiance − score du rang 2` (ou `confiance` s'il n'y a pas de second) |
+| `statut` | voir ci-dessous |
+| `sources_pour`, `sources_contre` | repris du rang 1 |
+| `explication` | JSON reprenant les éléments ci-dessus |
+
+**Statut — évaluer dans cet ordre exact**
+
+1. `confiance < score_min` → `donnees_insuffisantes`
+2. présence d'un second **et** `ecart < ecart_contradiction` → `contradictoire`
+3. `ecart < ecart_incertain` → `incertain`
+4. `nb_sources >= 2` **et** `confiance >= score_confirme` → `confirme`
+5. `confiance >= score_probable` → `probable`
+6. sinon → `incertain`
+
+L'écart compte autant que le score : un pays à 0.6 sans concurrent est plus sûr qu'un pays à 0.8 talonné par un autre à 0.78.
+
+---
+
+## Job 5 — intervalle_sejour
+
+Regroupe les jours consécutifs dans le même pays.
+
+**Grain** : un séjour continu
+
+| Colonne | Calcul |
+|---|---|
+| `pays`, `date_debut`, `date_fin` | bornes du segment |
+| `duree_jours` | `datediff(date_fin, date_debut) + 1` |
+| `nb_jours_observes` | nombre de jours réellement présents |
+| `confiance_moyenne`, `confiance_min` | sur les jours du segment |
+| `has_contradiction` | vrai si au moins un jour a le statut `contradictoire` |
+
+**Segmentation** : parcourir les jours d'une entité par ordre chronologique. Nouveau segment si le pays change, ou si l'écart avec le jour précédent dépasse `gap_max_days + 1`. Utiliser `lag()` sur une fenêtre partitionnée par `entity_key`, puis une somme cumulative pour numéroter les segments.
+
+`confiance_min` est important : il révèle le maillon faible qu'une moyenne masquerait.
+
+**Incrémental** : cette étape n'est pas journalière. Pour chaque entité touchée par le batch, supprimer les intervalles chevauchant la période et les reconstruire depuis `position_quotidienne`.
+
+---
+
+## Stratégie incrémentale (jobs 1 à 4)
+
+1. Déterminer les dates touchées par le batch (dates du jour + `late_buffer_days`).
+2. Pour chaque étape, relire **toutes** les données de ces dates — pas seulement les nouvelles — et recalculer intégralement.
+3. Écraser les partitions correspondantes.
+
+Le recalcul complet de la partition est nécessaire parce que les agrégats ne sont pas additifs : ajouter une observation change la cohérence interne de tout le jour.
+
+Les jobs 1 à 4 sont strictement journaliers, aucun jour ne dépend d'un autre. Ne pas élargir la fenêtre au-delà du buffer.
+
+---
+
+## Ce que tu dois produire
+
+1. `common.py` — session Spark configurée pour Iceberg, chargement des configurations, utilitaires d'écriture par partition
+2. `job_silver.py`, `job_hyp_source.py`, `job_hyp_finale.py`, `job_position.py`, `job_intervalle.py`
+3. `run_pipeline.py` — orchestrateur, prend en argument la date de traitement
+4. Les DDL Iceberg des cinq tables, avec partitionnement et bucketing
+5. Un jeu de données d'exemple et un test qui vérifie ces quatre cas :
+   - **convergence** : deux sources disent le même pays → `confirme`
+   - **contradiction** : deux sources disent des pays différents le même jour → `contradictoire`, les deux pays conservés
+   - **non-résolu partagé** : un identifiant absent du mapping, présent dans deux sources déclarant le même `id_namespace` → une seule `entity_key`, convergence normale
+   - **aucun score nul** : toutes les décisions ont une confiance strictement positive
+
+## Contraintes de qualité
+
+- Ne jamais supprimer une observation : ce qui est douteux est scoré bas, pas filtré
+- Les quatre composantes de score restent en colonnes séparées, jamais fusionnées
+- Tri explicite avant toute agrégation dépendante de l'ordre, pour garantir la reproductibilité
+- Aucune UDF Python si une fonction Spark native existe
+
+## Hors périmètre V1
+
+Ne les implémente pas, mais ne rends pas leur ajout impossible : coordonnées x/y vers pays, cohérence temporelle et détection de sauts aberrants, groupes de dépendance entre sources, score de fiabilité calculé, table de lignage, recalcul rétroactif des mappings.
