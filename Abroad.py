@@ -1,4 +1,47 @@
-
+① daily_by_logic — récapitulatif complet
+Rôle
+Vérifier la cohérence de chaque logique avec elle-même. Pas d'arbitrage entre logiques ici — ça, c'est ②.
+C'est aussi la première couche qui décide : elle porte un ruleset_version et se recalcule intégralement depuis Silver.
+Grain
+(entity_key, logic_id, day, country_code)
+⚠️ Modifié en cours de route. Le DDL initial était (entity_key, logic_id, day) avec un ROW_NUMBER pour ne garder qu'un pays. Abandonné : le pays écarté doit rester visible pour alimenter country_scores en ②.
+Rien n'est jamais supprimé. Un pays écarté garde sa ligne avec weight = 0.
+Ce que les données ont imposé
+Constat
+Traitement
+Contradictions frontalières quasi partout
+Ratio de volume ≈ 0,15 croisé avec l'adjacence
+Sauts vers pays non frontaliers, volume faible
+IMPLAUSIBLE_JUMP
+Volumes ~50 max
+Racine carrée, pas de logarithme
+Plusieurs identifiants distincts concordants
+nb_identifiers — le signal le plus fort
+Identifiants pollués
+Jointure ici, pas en Silver (flag rétroactif)
+Hiérarchie de force
+Du plus au moins convaincant :
+Plusieurs logiques d'accord → mais ça, c'est ②
+Une logique, plusieurs identifiants distincts
+Une logique, un identifiant, beaucoup d'événements
+Une logique, un identifiant, peu d'événements
+Le poids
+Code
+weight = 0 si OUTLIER ou EXCLUDED. × 0,5 si CONFLICT_INTERNAL.
+Points de vigilance
+Tri déterministe obligatoire — country_code en dernier critère. Sinon le résultat bascule d'un run à l'autre sans que les données bougent.
+MIN_TOP_VOLUME — en dessous, on ne conclut pas au bruit. 15 contre 2 passe, 5 contre 1 non. Paramètre le plus fragile.
+coherence_score reste NULL — il se calcule sur une période, seconde passe.
+Ne transposez pas le ratio de volume en ② — un franchissement de frontière face à 40 000 CDR n'a pas de sens comparatif.
+Prérequis
+prod.ref.country_adjacency — à construire, symétrique, versionnée
+Mapping MCC corrigé + lignes Guam supprimées
+prod.ref.non_individual_ids — la table de l'autre équipe
+À corriger dans le code déjà écrit
+Retirer is_non_individual de Silver → jointure dans ①
+Ajouter MAX(ref_version) en sortie pour la traçabilité
+DDL : ajouter nb_identifiers, nb_countries, ratio
+Par quoi on commence — le DDL corrigé, ou country_adjacency ?
 
 # =====================================================================
 #  PIPELINE FINAL v2 — logiques pilotées par la CONFIG JSON (Oracle CLOB)
