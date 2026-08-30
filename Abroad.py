@@ -1,4 +1,565 @@
 """
+ÉTAPE ② — de Silver aux tables de service, en une passe.
+
+Il n'y a plus d'étape ①. ② lit Silver directement.
+
+CHAÎNE :
+    silver.location_events
+        → 2b  poids PAR IDENTIFIANT      (la pollution ne contamine que sa part)
+        → 2c  scores par (personne, jour, pays) + bornes + comptage de logiques
+        → 2d  test de recouvrement       (journée à mouvement ou non ?)
+        → 2e  découpage en plages        (points de rupture)
+        → 2f  ancrage sur les transitions
+        → 2g  timeline continue + trous  (heures et jours, même mécanisme)
+        → 2h  projection sur les jours   (grille dense)
+        → 2i  écriture des 4 tables de service
+
+PRINCIPE : le système note, il ne tranche pas. Aucun score n'est jamais nul.
+"""
+
+from pyspark.sql import functions as F, Window
+
+# ═════════════════════════════════════════════════════════════════════
+# PARAMÈTRES
+# ═════════════════════════════════════════════════════════════════════
+RULESET_VERSION = "v0.2"
+
+VOLUME_REF       = 20     # saturation du facteur de volume — à recalibrer
+LOGIC_BONUS      = 0.6    # bonus par logique indépendante supplémentaire
+LOGIC_CAP        = 2.5
+POLLUTION_FLOOR  = 0.02   # dépréciation, PAS exclusion
+MISSING_IDENT_CONF = 0.50 # confiance d'identité absente : ni récompensée ni nulle
+OVERLAP_MAX      = 0.70   # au-dessus : journée sans mouvement, on ne découpe pas
+TRANSITION_CONF  = 1.00   # une transition est rattachée à la personne : un seul doute
+TRANSITION_WEIGHT = 3.0   # poids de l'ancre. Domine sans écraser.
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 2a — LECTURE
+# ═════════════════════════════════════════════════════════════════════
+def read_silver(spark, day_from, day_to):
+    """
+    Filtre sur les personnes résolues : les traces orphelines n'ont pas de
+    parcours. Elles restent consultables dans Silver, elles n'entrent pas ici.
+    C'est ce filtre qui rend tout l'aval bon marché.
+    """
+    base = (
+        spark.table("prod.silver.location_events")
+        .where(
+            (F.col("observation_date") >= F.to_date(F.lit(day_from)))
+            & (F.col("observation_date") <= F.to_date(F.lit(day_to)))
+            & F.col("person_id").isNotNull()
+        )
+        # is_non_individual est désormais porté par Silver.
+        # non_ind_ref_version dit QUAND le flag a été rafraîchi : il est
+        # rétroactif, donc une valeur périmée doit rester détectable.
+        .withColumn("is_non_individual",
+                    F.coalesce(F.col("is_non_individual"), F.lit(False)))
+        .withColumn("identity_confidence",
+                    F.coalesce(F.col("identity_confidence"),
+                               F.lit(MISSING_IDENT_CONF)))
+    )
+
+    presences = base.where(
+        (F.col("event_type") == "PRESENCE") & F.col("country_code").isNotNull()
+    )
+    transitions = base.where(F.col("event_type") == "TRANSITION")
+
+    return presences, transitions
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 2b — POIDS PAR IDENTIFIANT
+# ═════════════════════════════════════════════════════════════════════
+def weight_per_identifier(presences):
+    """
+    Le poids se calcule ligne par ligne, JAMAIS sur des moyennes.
+
+    C'est ce qui empêche la contamination : un identifiant pollué parmi cinq
+    ne déprécie que sa propre contribution. Les quatre autres gardent la leur.
+    Une moyenne de confiance d'identité aurait dilué un 0,54 dans un 0,96 —
+    ici chaque identifiant apporte exactement ce qu'il vaut.
+    """
+    volume_factor = F.lit(0.5) + F.lit(0.5) * F.least(
+        F.sqrt(F.col("evidence_count")) / F.sqrt(F.lit(float(VOLUME_REF))),
+        F.lit(1.0),
+    )
+
+    return (
+        presences
+        .withColumn("volume_factor", volume_factor)
+        .withColumn(
+            "w_raw",
+            F.col("source_confidence")
+            * F.col("identity_confidence")
+            * F.col("volume_factor"),
+        )
+        .withColumn(
+            "w",
+            F.when(F.col("is_non_individual"),
+                   F.col("w_raw") * F.lit(POLLUTION_FLOOR))
+             .otherwise(F.col("w_raw")),
+        )
+        .withColumn(
+            "reason_code",
+            F.when(F.col("is_non_individual"), F.lit("NON_INDIVIDUAL"))
+             .otherwise(F.lit(None).cast("string")),
+        )
+        .select(
+            "person_id", "observation_date", "country_code",
+            "identifier_norm", "identifier_type", "identity_confidence",
+            "logic_id", "source_id", "source_confidence",
+            "evidence_count", "valid_from", "valid_to",
+            "is_non_individual", "reason_code",
+            "w_raw", "w",
+        )
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 2c — SCORE PAR (personne, jour, pays)
+# ═════════════════════════════════════════════════════════════════════
+def country_day_scores(wid):
+    """
+    Somme des contributions individuelles, puis bonus d'accord entre logiques.
+
+    La hiérarchie de force exige DEUX compteurs distincts : plusieurs logiques
+    indépendantes qui concordent valent bien plus que plusieurs identifiants
+    d'une même logique. Le bonus porte donc sur nb_logics, pas sur nb_identifiers
+    — ce dernier est déjà reflété dans la somme des poids.
+    """
+    agg = (
+        wid.groupBy("person_id", "observation_date", "country_code")
+        .agg(
+            F.sum("w").alias("w_sum"),
+            F.sum("w_raw").alias("w_sum_raw"),
+            F.sum("evidence_count").alias("evidence_count"),
+            F.countDistinct("identifier_norm").alias("nb_identifiers"),
+            F.countDistinct("logic_id").alias("nb_logics"),
+            F.min("identity_confidence").alias("min_identity_confidence"),
+            F.min("valid_from").alias("span_start"),
+            F.max("valid_to").alias("span_end"),
+            F.sum(F.when(F.col("is_non_individual"), 1).otherwise(0))
+             .alias("nb_polluted"),
+        )
+    )
+
+    logic_factor = F.least(
+        F.lit(1.0) + F.lit(LOGIC_BONUS) * (F.col("nb_logics") - 1),
+        F.lit(LOGIC_CAP),
+    )
+
+    return agg.withColumn("score", F.col("w_sum") * logic_factor)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 2d — TEST DE RECOUVREMENT : la journée a-t-elle du mouvement ?
+# ═════════════════════════════════════════════════════════════════════
+def overlap_test(scores):
+    """
+    Jaccard temporel entre les bornes des pays candidats du jour.
+
+    Si deux pays couvrent quasiment la même journée, DÉCOUPER SERAIT MENTIR :
+    on fabriquerait une alternance A/B/A/B alors qu'on ignore quand chaque
+    événement a eu lieu à l'intérieur de sa plage. C'est une journée contestée,
+    pas une journée de déplacement.
+    """
+    w = Window.partitionBy("person_id", "observation_date")
+
+    return (
+        scores
+        .withColumn("nb_countries", F.count("*").over(w))
+        .withColumn("day_start", F.min("span_start").over(w))
+        .withColumn("day_end", F.max("span_end").over(w))
+        # intersection : le plus tardif des débuts, le plus précoce des fins
+        .withColumn("inter_start", F.max("span_start").over(w))
+        .withColumn("inter_end", F.min("span_end").over(w))
+        .withColumn(
+            "overlap",
+            F.when(F.col("nb_countries") < 2, F.lit(0.0)).otherwise(
+                F.greatest(
+                    F.unix_timestamp("inter_end") - F.unix_timestamp("inter_start"),
+                    F.lit(0),
+                )
+                / F.greatest(
+                    F.unix_timestamp("day_end") - F.unix_timestamp("day_start"),
+                    F.lit(1),
+                )
+            ),
+        )
+        .withColumn(
+            "is_segmentable",
+            (F.col("nb_countries") > 1) & (F.col("overlap") < OVERLAP_MAX),
+        )
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 2e — DÉCOUPAGE EN PLAGES
+# ═════════════════════════════════════════════════════════════════════
+def build_ranges(wid, day_flags, transitions):
+    """
+    Points de rupture = toutes les bornes d'intervalle + tous les instants
+    de transition. Entre deux ruptures consécutives, l'ensemble des preuves
+    actives est constant : une seule ligne suffit à décrire la plage.
+
+    On ne découpe QUE les journées jugées segmentables (2d).
+    """
+    segmentable = (
+        day_flags.where(F.col("is_segmentable"))
+        .select("person_id", "observation_date").distinct()
+    )
+
+    ev = wid.join(segmentable, ["person_id", "observation_date"], "inner")
+
+    cuts_ev = (
+        ev.select("person_id", "observation_date",
+                  F.col("valid_from").alias("t"))
+        .union(ev.select("person_id", "observation_date",
+                         F.col("valid_to").alias("t")))
+    )
+
+    cuts_tr = (
+        transitions.join(segmentable, ["person_id", "observation_date"], "inner")
+        .select("person_id", "observation_date",
+                F.col("valid_from").alias("t"))
+    )
+
+    cuts = cuts_ev.union(cuts_tr).distinct()
+
+    w = Window.partitionBy("person_id", "observation_date").orderBy("t")
+
+    ranges = (
+        cuts
+        .withColumn("range_end", F.lead("t").over(w))
+        .withColumnRenamed("t", "range_start")
+        .where(F.col("range_end").isNotNull())
+        .withColumn("range_seq", F.row_number().over(w))
+    )
+
+    # une preuve est active sur une plage si son intervalle la recouvre.
+    # ⚠️ HYPOTHÈSE : on suppose l'identifiant présent en continu entre ses
+    #    propres bornes. Silver ne donne que première et dernière observation.
+    #    Cette hypothèse est ÉTIQUETÉE plus bas, pas dissimulée.
+    active = (
+        ranges.join(ev, ["person_id", "observation_date"], "inner")
+        .where(
+            (F.col("valid_from") <= F.col("range_start"))
+            & (F.col("valid_to") >= F.col("range_end"))
+        )
+    )
+
+    return ranges, active
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 2f — ANCRAGE SUR LES TRANSITIONS
+# ═════════════════════════════════════════════════════════════════════
+def transition_anchors(transitions):
+    """
+    Une transition N'EST PAS convertie en présence dans Silver.
+    Elle reste une transition ; on lui donne ici, au moment du calcul,
+    un poids d'ancre sur l'intervalle qui suit.
+
+    Elle est rattachée DIRECTEMENT à la personne : pas d'identifiant
+    intermédiaire, donc une seule incertitude au lieu de deux. C'est ce qui
+    justifie TRANSITION_WEIGHT et identity_confidence = 1,0.
+
+    Règle : après T, le pays est `country_to` jusqu'à la transition suivante.
+            Avant T, il est `country_from`.
+    """
+    w = Window.partitionBy("person_id").orderBy("valid_from")
+
+    return (
+        transitions
+        .select(
+            "person_id", "observation_date",
+            F.col("valid_from").alias("t"),
+            "country_from", "country_to",
+            "source_id", "source_confidence", "event_id",
+        )
+        .withColumn("next_t", F.lead("t").over(w))
+        .withColumn("prev_t", F.lag("t").over(w))
+        .withColumn("anchor_weight", F.lit(TRANSITION_WEIGHT))
+        .withColumn("identity_confidence", F.lit(TRANSITION_CONF))
+    )
+
+
+def apply_anchors(active, anchors):
+    """
+    Le pays d'ancre reçoit un poids supplémentaire sur les plages couvertes.
+    Les autres pays ne sont PAS annulés — ils restent visibles avec leur score.
+    Le système note, l'utilisateur choisit.
+    """
+    a = anchors.select(
+        "person_id",
+        F.col("t").alias("anchor_t"),
+        F.coalesce(F.col("next_t"), F.lit("2999-12-31").cast("timestamp"))
+         .alias("anchor_until"),
+        F.col("country_to").alias("country_code"),
+        "anchor_weight",
+    )
+
+    return (
+        active.join(a, ["person_id", "country_code"], "left")
+        .withColumn(
+            "w_anchored",
+            F.when(
+                (F.col("anchor_t").isNotNull())
+                & (F.col("range_start") >= F.col("anchor_t"))
+                & (F.col("range_start") < F.col("anchor_until")),
+                F.col("w") + F.col("anchor_weight"),
+            ).otherwise(F.col("w")),
+        )
+        .withColumn("is_anchored",
+                    F.col("w_anchored") > F.col("w"))
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 2g — SCORES PAR PLAGE
+# ═════════════════════════════════════════════════════════════════════
+def range_scores(anchored):
+    """
+    top1 / top2 : le pays le mieux noté et l'autre possibilité.
+    Deux colonnes plates, pas de MAP : lisible en HQL.
+    nb_candidates prévient s'il y en a davantage.
+    """
+    agg = (
+        anchored.groupBy(
+            "person_id", "observation_date", "range_seq",
+            "range_start", "range_end", "country_code",
+        )
+        .agg(
+            F.sum("w_anchored").alias("score"),
+            F.countDistinct("logic_id").alias("nb_logics"),
+            F.countDistinct("identifier_norm").alias("nb_identifiers"),
+            F.max("is_anchored").alias("is_anchored"),
+            F.sum(F.when(F.col("is_non_individual"), 1).otherwise(0))
+             .alias("nb_polluted"),
+        )
+    )
+
+    w = Window.partitionBy("person_id", "observation_date", "range_seq")
+    w_rank = w.orderBy(
+        F.col("score").desc(),
+        F.col("nb_logics").desc(),
+        F.col("country_code").asc(),   # départage déterministe, sinon le
+    )                                   # résultat bascule d'un run à l'autre
+
+    ranked = (
+        agg
+        .withColumn("total_score", F.sum("score").over(w))
+        .withColumn("nb_candidates", F.count("*").over(w))
+        .withColumn("evidence_strength", F.col("total_score"))
+        .withColumn("rk", F.row_number().over(w_rank))
+        .withColumn("probability", F.col("score") / F.col("total_score"))
+    )
+
+    top1 = ranked.where(F.col("rk") == 1).select(
+        "person_id", "observation_date", "range_seq", "range_start", "range_end",
+        F.col("country_code").alias("country_top1"),
+        F.col("probability").alias("score_top1"),
+        "nb_logics", "nb_identifiers", "nb_candidates",
+        "evidence_strength", "is_anchored", "nb_polluted",
+    )
+    top2 = ranked.where(F.col("rk") == 2).select(
+        "person_id", "observation_date", "range_seq",
+        F.col("country_code").alias("country_top2"),
+        F.col("probability").alias("score_top2"),
+    )
+
+    return top1.join(top2, ["person_id", "observation_date", "range_seq"], "left")
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 2h — TIMELINE CONTINUE ET TROUS
+# ═════════════════════════════════════════════════════════════════════
+def fill_gaps(segments):
+    """
+    Un trou de 12 heures et un trou de 20 jours sont le MÊME objet.
+    Le jour n'est pas une unité de raisonnement, c'est une projection finale.
+
+    On ne comble pas en silence : chaque intervalle inféré porte son étiquette
+    et la durée exacte du trou de chaque côté. Le consommateur coupe où il veut,
+    on ne fixe aucune borne à sa place.
+    """
+    w = Window.partitionBy("person_id").orderBy("range_start")
+
+    return (
+        segments
+        .withColumn("prev_country", F.lag("country_top1").over(w))
+        .withColumn("prev_end", F.lag("range_end").over(w))
+        .withColumn("next_country", F.lead("country_top1").over(w))
+        .withColumn("next_start", F.lead("range_start").over(w))
+        .withColumn(
+            "gap_before_sec",
+            F.unix_timestamp("range_start") - F.unix_timestamp("prev_end"),
+        )
+        .withColumn(
+            "gap_after_sec",
+            F.unix_timestamp("next_start") - F.unix_timestamp("range_end"),
+        )
+        .withColumn(
+            "inference_method",
+            F.when(F.col("is_anchored"), F.lit("ANCHORED"))
+             .when(F.col("prev_country") == F.col("next_country"),
+                   F.lit("NEAREST_MATCH"))
+             .when(F.col("prev_country") != F.col("next_country"),
+                   F.lit("NEAREST_DIVERGENT"))
+             .when(F.col("prev_country").isNotNull(),
+                   F.lit("NEAREST_BEFORE_ONLY"))
+             .when(F.col("next_country").isNotNull(),
+                   F.lit("NEAREST_AFTER_ONLY"))
+             .otherwise(F.lit("OBSERVED")),
+        )
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 2i — PROJECTION SUR LES JOURS (grille dense)
+# ═════════════════════════════════════════════════════════════════════
+def project_to_days(spark, segments, day_from, day_to):
+    """
+    Grille dense : une ligne par personne et par jour, SANS TROU.
+    L'analyste SQL qui requête un jour sans donnée doit obtenir une réponse
+    et une explication, jamais zéro ligne.
+
+    day_share est calculé sur les segments, PAS sur les intervalles
+    d'observation : valid_from/valid_to sont des bornes d'OBSERVATION, pas
+    de présence. Une personne observée de 12h à 14h était probablement là
+    depuis minuit — le segment le sait, l'observation ne le sait pas.
+    """
+    persons = segments.select("person_id").distinct()
+    days = spark.sql(
+        f"SELECT explode(sequence(to_date('{day_from}'), "
+        f"to_date('{day_to}'), interval 1 day)) AS day"
+    )
+    grid = persons.crossJoin(days)
+
+    per_day = (
+        segments
+        .withColumn("day", F.to_date("range_start"))
+        .withColumn(
+            "duration_sec",
+            F.unix_timestamp("range_end") - F.unix_timestamp("range_start"),
+        )
+        .groupBy("person_id", "day", "country_top1")
+        .agg(
+            F.sum("duration_sec").alias("country_sec"),
+            F.max("score_top1").alias("score_top1"),
+            F.max("evidence_strength").alias("evidence_strength"),
+            F.max("nb_logics").alias("nb_logics"),
+            F.max("nb_candidates").alias("nb_candidates"),
+            F.min("inference_method").alias("worst_inference_method"),
+            F.count("*").alias("nb_segments"),
+        )
+    )
+
+    w = Window.partitionBy("person_id", "day")
+    daily = (
+        per_day
+        .withColumn("day_total_sec", F.sum("country_sec").over(w))
+        .withColumn("day_share", F.col("country_sec") / F.col("day_total_sec"))
+        .withColumn("nb_countries_in_day", F.count("*").over(w))
+        .withColumn(
+            "rk",
+            F.row_number().over(
+                w.orderBy(F.col("country_sec").desc(),
+                          F.col("country_top1").asc())
+            ),
+        )
+        .where(F.col("rk") == 1)
+        .drop("rk")
+    )
+
+    return (
+        grid.join(daily, ["person_id", "day"], "left")
+        .withColumn(
+            "inference_method",
+            F.coalesce(F.col("worst_inference_method"), F.lit("UNKNOWN")),
+        )
+        .withColumn(
+            "explanation",
+            F.when(F.col("country_top1").isNull(),
+                   F.lit("Aucune donnée pour cette personne ce jour-là."))
+             .when(F.col("nb_countries_in_day") > 1,
+                   F.concat_ws(
+                       "",
+                       F.lit("Journée à plusieurs pays ("),
+                       F.col("nb_countries_in_day").cast("string"),
+                       F.lit("). Dominant : "), F.col("country_top1"),
+                       F.lit(", part de la journée "),
+                       F.round(F.col("day_share"), 2).cast("string"),
+                       F.lit(". Voir le détail par plage."),
+                   ))
+             .otherwise(
+                   F.concat_ws(
+                       "",
+                       F.col("country_top1"),
+                       F.lit(" — "), F.col("nb_logics").cast("string"),
+                       F.lit(" logique(s), score "),
+                       F.round(F.col("score_top1"), 2).cast("string"),
+                   )),
+        )
+        .withColumn("ruleset_version", F.lit(RULESET_VERSION))
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════
+# ORCHESTRATION
+# ═════════════════════════════════════════════════════════════════════
+def run(spark, day_from, day_to):
+    presences, transitions = read_silver(spark, day_from, day_to)
+
+    wid       = weight_per_identifier(presences)
+    scores    = country_day_scores(wid)
+    day_flags = overlap_test(scores)
+    anchors   = transition_anchors(transitions)
+
+    ranges, active = build_ranges(wid, day_flags, transitions)
+    anchored       = apply_anchors(active, anchors)
+    segments       = fill_gaps(range_scores(anchored))
+    daily          = project_to_days(spark, segments, day_from, day_to)
+
+    return {
+        "person_segment":         segments,
+        "person_day":             daily,
+        "person_day_identifier":  wid,        # déjà plat : une ligne = un identifiant
+        "person_transition":      anchors,
+        "contested_days":         day_flags.where(~F.col("is_segmentable")
+                                                  & (F.col("nb_countries") > 1)),
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════
+# CONTRÔLES
+# ═════════════════════════════════════════════════════════════════════
+CHECKS = """
+-- ① Journées contestées SANS mouvement : le cas A/B.
+--    Si cette part est forte, OVERLAP_MAX est mal réglé.
+SELECT COUNT(*) FROM contested_days;
+
+-- ② Distribution de score_top1. Doit s'étaler.
+--    Un pic à 1,00 signale des journées à source unique : vérifier
+--    evidence_strength, car une source faible et seule sort AUSSI à 1,00.
+SELECT ROUND(score_top1, 1) AS s, COUNT(*) FROM person_segment GROUP BY 1 ORDER BY 1;
+
+-- ③ Saturation du facteur de volume. Si la part est forte, remonter VOLUME_REF.
+SELECT SUM(CASE WHEN evidence_count >= 20 THEN 1 ELSE 0 END)/COUNT(*)
+FROM person_day_identifier;
+
+-- ④ Part de la grille dense réellement observée vs inférée.
+SELECT inference_method, COUNT(*) FROM person_day GROUP BY 1 ORDER BY 2 DESC;
+
+-- ⑤ Vérifier qu'aucun score n'est nul.
+SELECT MIN(w) FROM person_day_identifier;   -- doit être > 0
+"""
+
+
+
+
+"""
 ÉTAPE ① — prod.gold.daily_by_logic
 
 Rôle : agréger, par logique, ce que chaque logique affirme pour un jour donné.
