@@ -62,14 +62,13 @@ CREATE TABLE IF NOT EXISTS prod.gold.daily_by_logic (
   identifiers       ARRAY<STRUCT<
                       identifier_norm: STRING,
                       identifier_type: STRING,
+                      source_ids: ARRAY<STRING>,
                       identity_confidence: DECIMAL(3,2),
                       evidence_count: BIGINT,
                       valid_from: TIMESTAMP,
                       valid_to: TIMESTAMP,
                       is_non_individual: BOOLEAN
                     >>,
-  source_ids        ARRAY<STRING>,
-  event_ids         ARRAY<STRING>,
 
   ruleset_version   STRING  NOT NULL,
   non_ind_ref_version STRING,
@@ -160,7 +159,6 @@ def build_daily_by_logic(spark, day_from, day_to):
             F.max("non_ind_ref_version").alias("non_ind_ref_version"),
             F.max("source_confidence").alias("source_confidence"),
             F.collect_set("source_id").alias("source_ids"),
-            F.collect_set("event_id").alias("event_ids"),
         )
         # une confiance d'identité manquante est traitée comme neutre-basse,
         # jamais comme parfaite : ne pas récompenser l'absence d'information
@@ -177,7 +175,7 @@ def build_daily_by_logic(spark, day_from, day_to):
 
             F.min("identity_confidence").alias("min_identity_confidence"),
             F.max("identity_confidence").alias("max_identity_confidence"),
-            # somme des confiances : sert au bonus d'identifiants pondéré
+            # une ligne par identifiant à ce stade : somme simple correcte
             F.sum("identity_confidence").alias("sum_identity_confidence"),
             # moyenne pondérée par le volume : un identifiant à 22 événements
             # pèse plus qu'un identifiant à 1 événement
@@ -197,12 +195,11 @@ def build_daily_by_logic(spark, day_from, day_to):
 
             F.collect_list(
                 F.struct(
-                    "identifier_norm", "identifier_type", "identity_confidence",
-                    "evidence_count", "valid_from", "valid_to", "is_non_individual",
+                    "identifier_norm", "identifier_type", "source_ids",
+                    "identity_confidence", "evidence_count",
+                    "valid_from", "valid_to", "is_non_individual",
                 )
             ).alias("identifiers"),
-            F.flatten(F.collect_set("source_ids")).alias("source_ids"),
-            F.flatten(F.collect_set("event_ids")).alias("event_ids"),
         )
         .withColumnRenamed("observation_date", "day")
     )
@@ -312,7 +309,7 @@ def build_daily_by_logic(spark, day_from, day_to):
              .alias("source_confidence_max"),
             "span_start", "span_end",
             "weight_raw", "weight_filtered",
-            "identifiers", "source_ids", "event_ids",
+            "identifiers",
             "ruleset_version", "non_ind_ref_version", "computed_at",
         )
     )
