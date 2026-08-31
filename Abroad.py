@@ -1,3 +1,648 @@
+def build_state_anchors(local_candidates, presence_anchors):
+
+    # ---------------------------------------------------------
+    # 1. RANGES : meilleur candidat local
+    # ---------------------------------------------------------
+
+    ranges = (
+        local_candidates
+        .where(F.col("candidate_rank") == 1)
+        .withColumn(
+            "strength_factor",
+            F.lit(1.0) - F.exp(-F.col("evidence_score"))
+        )
+        .withColumn(
+            "local_confidence_raw",
+            F.col("relative_score") * F.col("strength_factor")
+        )
+        .select(
+            "entity_key",
+
+            F.col("range_from").alias("state_from"),
+            F.col("range_to").alias("state_to"),
+
+            "country_code",
+
+            F.col("local_confidence_raw"),
+            F.col("evidence_score"),
+
+            F.lit("RANGE").alias("state_origin"),
+            F.col("range_id").alias("origin_id"),
+        )
+    )
+
+    # ---------------------------------------------------------
+    # 2. POINTS : plusieurs preuves ponctuelles peuvent arriver
+    #    exactement au même instant.
+    # ---------------------------------------------------------
+
+    point_scores = (
+        presence_anchors
+        .groupBy(
+            "entity_key",
+            "anchor_ts",
+            "country_code",
+        )
+        .agg(
+            F.sum("evidence_weight").alias("evidence_score"),
+            F.countDistinct("logic_id").alias("logic_count"),
+        )
+    )
+
+    w = Window.partitionBy(
+        "entity_key",
+        "anchor_ts",
+    )
+
+    w_rank = w.orderBy(
+        F.col("evidence_score").desc(),
+        F.col("logic_count").desc(),
+        F.col("country_code").asc(),
+    )
+
+    points = (
+        point_scores
+
+        .withColumn(
+            "total_score",
+            F.sum("evidence_score").over(w)
+        )
+
+        .withColumn(
+            "relative_score",
+            F.col("evidence_score") / F.col("total_score")
+        )
+
+        .withColumn(
+            "rk",
+            F.row_number().over(w_rank)
+        )
+
+        .where(F.col("rk") == 1)
+
+        .withColumn(
+            "strength_factor",
+            F.lit(1.0) - F.exp(-F.col("evidence_score"))
+        )
+
+        .withColumn(
+            "local_confidence_raw",
+            F.col("relative_score") * F.col("strength_factor")
+        )
+
+        .select(
+            "entity_key",
+
+            F.col("anchor_ts").alias("state_from"),
+            F.col("anchor_ts").alias("state_to"),
+
+            "country_code",
+            "local_confidence_raw",
+            "evidence_score",
+
+            F.lit("POINT").alias("state_origin"),
+
+            F.sha2(
+                F.concat_ws(
+                    "||",
+                    "entity_key",
+                    F.col("anchor_ts").cast("string"),
+                    "country_code",
+                ),
+                256
+            ).alias("origin_id")
+        )
+    )
+
+    return ranges.unionByName(points)
+
+
+def build_state_adjacencies(state_anchors):
+
+    w = (
+        Window
+        .partitionBy("entity_key")
+        .orderBy(
+            "state_from",
+            "state_to",
+            "country_code",
+        )
+    )
+
+    return (
+        state_anchors
+
+        .withColumn(
+            "next_country",
+            F.lead("country_code").over(w)
+        )
+
+        .withColumn(
+            "next_from",
+            F.lead("state_from").over(w)
+        )
+
+        .withColumn(
+            "next_to",
+            F.lead("state_to").over(w)
+        )
+
+        .withColumn(
+            "next_confidence_raw",
+            F.lead("local_confidence_raw").over(w)
+        )
+
+        .withColumn(
+            "next_origin_id",
+            F.lead("origin_id").over(w)
+        )
+
+        .where(F.col("next_country").isNotNull())
+
+        .withColumn(
+            "gap_sec",
+            F.greatest(
+                F.unix_timestamp("next_from")
+                - F.unix_timestamp("state_to"),
+                F.lit(0)
+            )
+        )
+    )
+GAP_DECAY_DAYS = 30.0
+
+
+def build_same_country_gaps(adjacencies):
+
+    gaps = (
+        adjacencies
+
+        .where(
+            (F.col("country_code") == F.col("next_country"))
+            & (F.col("next_from") > F.col("state_to"))
+        )
+
+        .withColumn(
+            "gap_days",
+            F.col("gap_sec") / F.lit(86400.0)
+        )
+
+        .withColumn(
+            "boundary_confidence",
+            F.least(
+                F.col("local_confidence_raw"),
+                F.col("next_confidence_raw"),
+            )
+        )
+
+        # Plus le trou est long, plus on est prudent.
+        .withColumn(
+            "confidence_raw",
+            F.col("boundary_confidence")
+            * F.exp(
+                -F.col("gap_days") / F.lit(GAP_DECAY_DAYS)
+            )
+        )
+
+        .select(
+            "entity_key",
+
+            F.col("state_to").alias("fragment_from"),
+            F.col("next_from").alias("fragment_to"),
+
+            "country_code",
+
+            F.lit("INFERRED").alias("fragment_type"),
+            F.lit("SAME_COUNTRY_BETWEEN")
+             .alias("inference_method"),
+
+            "confidence_raw",
+
+            F.col("origin_id").alias("left_origin_id"),
+            F.col("next_origin_id").alias("right_origin_id"),
+        )
+    )
+
+    return gaps
+
+
+def build_observed_fragments(state_anchors):
+
+    return (
+        state_anchors
+        .select(
+            "entity_key",
+
+            F.col("state_from").alias("fragment_from"),
+            F.col("state_to").alias("fragment_to"),
+
+            "country_code",
+
+            F.lit("OBSERVED").alias("fragment_type"),
+            F.lit("DIRECT").alias("inference_method"),
+
+            F.col("local_confidence_raw").alias("confidence_raw"),
+
+            F.col("origin_id").alias("left_origin_id"),
+            F.col("origin_id").alias("right_origin_id"),
+        )
+    )
+
+
+
+
+
+def build_inferred_transitions(adjacencies):
+
+    return (
+        adjacencies
+
+        .where(
+            F.col("country_code") != F.col("next_country")
+        )
+
+        .withColumn(
+            "transition_confidence_raw",
+            F.least(
+                F.col("local_confidence_raw"),
+                F.col("next_confidence_raw"),
+            )
+        )
+
+        .withColumn(
+            "window_duration_sec",
+            F.greatest(
+                F.unix_timestamp("next_from")
+                - F.unix_timestamp("state_to"),
+                F.lit(0),
+            )
+        )
+
+        .withColumn(
+            "window_days",
+            F.col("window_duration_sec") / F.lit(86400.0)
+        )
+
+        # On peut être sûr qu'un changement a eu lieu,
+        # sans savoir précisément quand.
+        .withColumn(
+            "timing_confidence_raw",
+            F.exp(
+                -F.col("window_days") / F.lit(7.0)
+            )
+        )
+
+        .select(
+            "entity_key",
+
+            F.col("country_code").alias("country_from"),
+            F.col("next_country").alias("country_to"),
+
+            F.col("state_to")
+             .alias("transition_window_from"),
+
+            F.col("next_from")
+             .alias("transition_window_to"),
+
+            F.lit(None)
+             .cast("timestamp")
+             .alias("transition_ts"),
+
+            F.lit("INFERRED").alias("transition_type"),
+
+            F.lit("BETWEEN_DIFFERENT_COUNTRIES")
+             .alias("inference_method"),
+
+            "transition_confidence_raw",
+            "timing_confidence_raw",
+
+            "window_duration_sec",
+
+            F.col("origin_id").alias("left_origin_id"),
+            F.col("next_origin_id").alias("right_origin_id"),
+        )
+    )
+
+def refine_transitions_with_explicit(
+    inferred_transitions,
+    transition_anchors
+):
+
+    i = inferred_transitions.alias("i")
+    t = transition_anchors.alias("t")
+
+    matches = (
+        i.join(
+            t,
+            on=(
+                (F.col("i.entity_key") == F.col("t.entity_key"))
+
+                & (
+                    F.col("i.country_from")
+                    == F.col("t.country_from")
+                )
+
+                & (
+                    F.col("i.country_to")
+                    == F.col("t.country_to")
+                )
+
+                & (
+                    F.col("t.transition_ts")
+                    >= F.col("i.transition_window_from")
+                )
+
+                & (
+                    F.col("t.transition_ts")
+                    <= F.col("i.transition_window_to")
+                )
+            ),
+            how="left"
+        )
+    )
+
+    w = (
+        Window
+        .partitionBy(
+            F.col("i.entity_key"),
+            F.col("i.left_origin_id"),
+            F.col("i.right_origin_id"),
+        )
+        .orderBy(
+            F.col("t.evidence_weight").desc_nulls_last()
+        )
+    )
+
+    best = (
+        matches
+
+        .withColumn(
+            "explicit_rank",
+            F.row_number().over(w)
+        )
+
+        .where(F.col("explicit_rank") == 1)
+
+        .select(
+            F.col("i.entity_key").alias("entity_key"),
+
+            F.col("i.country_from").alias("country_from"),
+            F.col("i.country_to").alias("country_to"),
+
+            F.when(
+                F.col("t.transition_ts").isNotNull(),
+                F.col("t.transition_ts")
+            )
+            .otherwise(
+                F.col("i.transition_window_from")
+            )
+            .alias("transition_window_from"),
+
+            F.when(
+                F.col("t.transition_ts").isNotNull(),
+                F.col("t.transition_ts")
+            )
+            .otherwise(
+                F.col("i.transition_window_to")
+            )
+            .alias("transition_window_to"),
+
+            F.col("t.transition_ts").alias("transition_ts"),
+
+            F.when(
+                F.col("t.transition_ts").isNotNull(),
+                F.lit("OBSERVED_REFINED")
+            )
+            .otherwise(
+                F.lit("INFERRED")
+            )
+            .alias("transition_type"),
+
+            F.when(
+                F.col("t.transition_ts").isNotNull(),
+                F.lit("SILVER_TRANSITION")
+            )
+            .otherwise(
+                F.col("i.inference_method")
+            )
+            .alias("inference_method"),
+
+            F.when(
+                F.col("t.transition_ts").isNotNull(),
+                F.greatest(
+                    F.col("i.transition_confidence_raw"),
+                    F.col("t.evidence_weight"),
+                )
+            )
+            .otherwise(
+                F.col("i.transition_confidence_raw")
+            )
+            .alias("confidence_raw"),
+
+            F.when(
+                F.col("t.transition_ts").isNotNull(),
+                F.col("t.evidence_weight")
+            )
+            .otherwise(
+                F.col("i.timing_confidence_raw")
+            )
+            .alias("timing_confidence_raw"),
+
+            F.col("t.silver_event_id")
+             .alias("explicit_silver_event_id"),
+
+            F.col("i.left_origin_id").alias("left_origin_id"),
+            F.col("i.right_origin_id").alias("right_origin_id"),
+        )
+    )
+
+    return best
+
+
+def build_temporal_fragments(
+    state_anchors,
+    adjacencies
+):
+
+    observed = build_observed_fragments(
+        state_anchors
+    )
+
+    inferred = build_same_country_gaps(
+        adjacencies
+    )
+
+    return observed.unionByName(inferred)
+
+
+
+def merge_fragments_to_segments(fragments):
+
+    w = (
+        Window
+        .partitionBy("entity_key")
+        .orderBy(
+            "fragment_from",
+            "fragment_to",
+        )
+    )
+
+    tmp = (
+        fragments
+
+        .withColumn(
+            "prev_country",
+            F.lag("country_code").over(w)
+        )
+
+        .withColumn(
+            "prev_to",
+            F.lag("fragment_to").over(w)
+        )
+
+        .withColumn(
+            "new_segment",
+            F.when(
+                F.col("prev_country").isNull(),
+                F.lit(1)
+            )
+            .when(
+                F.col("country_code") != F.col("prev_country"),
+                F.lit(1)
+            )
+            .when(
+                F.col("fragment_from") > F.col("prev_to"),
+                F.lit(1)
+            )
+            .otherwise(F.lit(0))
+        )
+    )
+
+    w_running = (
+        Window
+        .partitionBy("entity_key")
+        .orderBy(
+            "fragment_from",
+            "fragment_to"
+        )
+        .rowsBetween(
+            Window.unboundedPreceding,
+            Window.currentRow
+        )
+    )
+
+    tmp = (
+        tmp
+        .withColumn(
+            "segment_group",
+            F.sum("new_segment").over(w_running)
+        )
+    )
+
+    segments = (
+        tmp
+        .groupBy(
+            "entity_key",
+            "segment_group",
+            "country_code",
+        )
+        .agg(
+            F.min("fragment_from").alias("segment_from"),
+            F.max("fragment_to").alias("segment_to"),
+
+            F.min("confidence_raw").alias("confidence_raw"),
+
+            F.max(
+                F.when(
+                    F.col("fragment_type") == "OBSERVED",
+                    1
+                ).otherwise(0)
+            ).alias("has_observed"),
+
+            F.max(
+                F.when(
+                    F.col("fragment_type") == "INFERRED",
+                    1
+                ).otherwise(0)
+            ).alias("has_inferred"),
+        )
+
+        .withColumn(
+            "result_type",
+            F.when(
+                (F.col("has_observed") == 1)
+                & (F.col("has_inferred") == 1),
+                F.lit("MIXED")
+            )
+            .when(
+                F.col("has_observed") == 1,
+                F.lit("OBSERVED")
+            )
+            .otherwise(
+                F.lit("INFERRED")
+            )
+        )
+
+        .withColumn(
+            "segment_id",
+            F.sha2(
+                F.concat_ws(
+                    "||",
+                    "entity_key",
+                    "country_code",
+                    F.col("segment_from").cast("string"),
+                    F.col("segment_to").cast("string"),
+                    F.lit(RULESET_VERSION),
+                ),
+                256
+            )
+        )
+    )
+
+    return segments
+
+
+def temporal_engine(stage1):
+
+    state_anchors = build_state_anchors(
+        stage1["local_candidates"],
+        stage1["presence_anchors"],
+    )
+
+    adjacencies = build_state_adjacencies(
+        state_anchors
+    )
+
+    fragments = build_temporal_fragments(
+        state_anchors,
+        adjacencies,
+    )
+
+    segments = merge_fragments_to_segments(
+        fragments
+    )
+
+    inferred_transitions = build_inferred_transitions(
+        adjacencies
+    )
+
+    transitions = refine_transitions_with_explicit(
+        inferred_transitions,
+        stage1["transition_anchors"],
+    )
+
+    return {
+        "state_anchors": state_anchors,
+        "adjacencies": adjacencies,
+
+        "segments": segments,
+        "transitions": transitions,
+    }
+
+
+
+
+
+
 """
 ÉTAPE ② — de Silver aux tables de service, en une passe.
 
