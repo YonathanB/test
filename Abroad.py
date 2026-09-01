@@ -16,6 +16,10 @@ from pyspark.sql import DataFrame, Window
 from pyspark.sql import functions as F
 
 
+TIME_DECAY_DAYS = 3.0
+MAX_INFERENCE_GAP_DAYS = 30.0
+
+
 _REQUIRED_RANGE_COLUMNS = {
     "entity_key",
     "range_id",
@@ -416,10 +420,241 @@ def fill_temporal_gaps(
     return filled_ranges, unresolved_gaps
 
 
+def build_gap_candidates(
+    unresolved_gaps: DataFrame,
+    time_decay_days: float = TIME_DECAY_DAYS,
+    max_inference_gap_days: float = MAX_INFERENCE_GAP_DAYS,
+) -> DataFrame:
+    """Produit les pays plausibles uniquement pour les trous non résolus.
+
+    La fonction ne recherche plus elle-même les trous dans ``resolved_ranges``.
+    Elle reçoit directement le contrat produit par ``fill_temporal_gaps()`` :
+    pays et score de la borne gauche, pays et score de la borne droite.
+
+    Chaque trou est découpé aux frontières des jours. Pour chaque tranche,
+    l'influence d'une borne est :
+
+        boundary_score * exp(-distance_days / time_decay_days)
+
+    ``candidate_share`` est un poids relatif entre les candidats de la même
+    tranche, pas une probabilité calibrée.
+    """
+    required = {
+        "entity_key",
+        "gap_id",
+        "gap_from",
+        "gap_to",
+        "gap_duration_seconds",
+        "gap_duration_days",
+        "country_before",
+        "country_after",
+        "score_before",
+        "score_after",
+    }
+    _require_columns(unresolved_gaps, required, "unresolved_gaps")
+
+    if time_decay_days <= 0:
+        raise ValueError("time_decay_days doit être strictement positif")
+    if max_inference_gap_days <= 0:
+        raise ValueError(
+            "max_inference_gap_days doit être strictement positif"
+        )
+
+    # gap_to est une borne exclusive. Soustraire une seconde évite de créer
+    # une tranche vide le jour suivant lorsque gap_to tombe exactement à 00:00.
+    eligible_gaps = (
+        unresolved_gaps
+        .where(
+            (F.col("gap_duration_seconds") > 0)
+            & (F.col("gap_duration_days") <= F.lit(max_inference_gap_days))
+        )
+        .withColumn(
+            "_last_gap_day",
+            F.to_date(
+                F.from_unixtime(F.unix_timestamp("gap_to") - F.lit(1))
+            ),
+        )
+    )
+
+    slices = (
+        eligible_gaps
+        .withColumn(
+            "_slice_day",
+            F.explode(
+                F.sequence(
+                    F.to_date("gap_from"),
+                    F.col("_last_gap_day"),
+                    F.expr("INTERVAL 1 DAY"),
+                )
+            ),
+        )
+        .withColumn(
+            "slice_from",
+            F.greatest(
+                F.col("gap_from"),
+                F.col("_slice_day").cast("timestamp"),
+            ),
+        )
+        .withColumn(
+            "slice_to",
+            F.least(
+                F.col("gap_to"),
+                F.date_add(F.col("_slice_day"), 1).cast("timestamp"),
+            ),
+        )
+        .where(F.col("slice_to") > F.col("slice_from"))
+        .withColumn(
+            "_slice_mid_epoch",
+            (
+                F.unix_timestamp("slice_from")
+                + F.unix_timestamp("slice_to")
+            ) / F.lit(2.0),
+        )
+        .withColumn(
+            "_distance_before_days",
+            (
+                F.col("_slice_mid_epoch")
+                - F.unix_timestamp("gap_from")
+            ) / F.lit(86400.0),
+        )
+        .withColumn(
+            "_distance_after_days",
+            (
+                F.unix_timestamp("gap_to")
+                - F.col("_slice_mid_epoch")
+            ) / F.lit(86400.0),
+        )
+    )
+
+    common_columns = [
+        "entity_key",
+        "gap_id",
+        "gap_from",
+        "gap_to",
+        "slice_from",
+        "slice_to",
+    ]
+
+    candidates_before = slices.select(
+        *common_columns,
+        F.col("country_before").alias("country_code"),
+        F.col("score_before").cast("double").alias("boundary_score"),
+        F.col("_distance_before_days").alias("distance_days"),
+        F.lit("BEFORE").alias("supported_by"),
+    )
+
+    candidates_after = slices.select(
+        *common_columns,
+        F.col("country_after").alias("country_code"),
+        F.col("score_after").cast("double").alias("boundary_score"),
+        F.col("_distance_after_days").alias("distance_days"),
+        F.lit("AFTER").alias("supported_by"),
+    )
+
+    raw_candidates = (
+        candidates_before
+        .unionByName(candidates_after)
+        .where(
+            F.col("country_code").isNotNull()
+            & F.col("boundary_score").isNotNull()
+            & (F.col("boundary_score") > 0)
+        )
+        .withColumn(
+            "influence",
+            F.col("boundary_score")
+            * F.exp(
+                -F.col("distance_days") / F.lit(float(time_decay_days))
+            ),
+        )
+    )
+
+    # Si les deux bornes portent le même pays, leurs influences sont cumulées
+    # avant la normalisation : on ne crée pas deux candidats identiques.
+    candidates = (
+        raw_candidates
+        .groupBy(
+            "entity_key",
+            "gap_id",
+            "gap_from",
+            "gap_to",
+            "slice_from",
+            "slice_to",
+            "country_code",
+        )
+        .agg(
+            F.sum("influence").alias("candidate_score"),
+            F.min("distance_days").alias("distance_days"),
+            F.sort_array(F.collect_set("supported_by")).alias("supported_by"),
+        )
+    )
+
+    candidate_window = Window.partitionBy(
+        "entity_key",
+        "gap_id",
+        "slice_from",
+        "slice_to",
+    )
+    candidate_rank_window = candidate_window.orderBy(
+        F.col("candidate_score").desc(),
+        F.col("country_code").asc(),
+    )
+
+    return (
+        candidates
+        .withColumn(
+            "candidate_total_score",
+            F.sum("candidate_score").over(candidate_window),
+        )
+        .withColumn(
+            "candidate_share",
+            F.col("candidate_score") / F.col("candidate_total_score"),
+        )
+        .withColumn(
+            "candidate_count",
+            F.count(F.lit(1)).over(candidate_window),
+        )
+        .withColumn(
+            "candidate_rank",
+            F.row_number().over(candidate_rank_window),
+        )
+        .withColumn(
+            "range_id",
+            _stable_id(
+                F.col("gap_id"),
+                F.col("slice_from"),
+                F.col("slice_to"),
+                F.col("country_code"),
+            ),
+        )
+        .withColumnRenamed("slice_from", "range_from")
+        .withColumnRenamed("slice_to", "range_to")
+        .withColumn("evidence_score", F.lit(None).cast("double"))
+        .withColumn("relative_score", F.col("candidate_share"))
+        .withColumn("evidence_count", F.lit(0).cast("long"))
+        .withColumn("source_count", F.lit(0).cast("long"))
+        .withColumn("logic_count", F.lit(0).cast("long"))
+        .withColumn("total_evidence_score", F.lit(None).cast("double"))
+        .withColumn("transition_support", F.lit(None).cast("double"))
+        .withColumn("adjusted_score", F.col("candidate_score"))
+        .withColumn("adjusted_rank", F.col("candidate_rank"))
+        .withColumn("original_country_code", F.col("country_code"))
+        .withColumn("original_adjusted_score", F.col("candidate_score"))
+        .withColumn("resolution_method", F.lit("TEMPORAL_DECAY_CANDIDATE"))
+        .withColumn("is_temporally_inferred", F.lit(True))
+        .withColumn(
+            "temporal_resolution_method",
+            F.lit("TEMPORAL_DECAY"),
+        )
+        .withColumn("temporal_support_score", F.col("candidate_score"))
+        .withColumn("inference_method", F.lit("TIME_DECAY"))
+    )
+
+
 def attach_gap_candidates(
     filled_ranges: DataFrame,
     unresolved_gaps: DataFrame,
-    build_gap_candidates,
+    time_decay_days: float = TIME_DECAY_DAYS,
+    max_inference_gap_days: float = MAX_INFERENCE_GAP_DAYS,
 ) -> tuple[DataFrame, DataFrame]:
     """Branchement minimal à utiliser dans ``temporal_engine(stage1)``.
 
@@ -427,7 +662,11 @@ def attach_gap_candidates(
     non ``resolved_ranges``. Il reste ainsi l'unique responsable des pays
     plausibles, de la décroissance temporelle et de ``candidate_share``.
     """
-    gap_candidates = build_gap_candidates(unresolved_gaps)
+    gap_candidates = build_gap_candidates(
+        unresolved_gaps,
+        time_decay_days=time_decay_days,
+        max_inference_gap_days=max_inference_gap_days,
+    )
     resolved_timeline = filled_ranges.unionByName(
         gap_candidates,
         allowMissingColumns=True,
