@@ -2,436 +2,250 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 
-# ============================================================
+# =========================
 # CALIBRATION
-# ============================================================
+# =========================
 
-MAX_CONTINUITY_GAP_HOURS = 72
-MAX_TRANSITION_BRIDGE_GAP_HOURS = 72
+TIME_DECAY_DAYS = 3.0
+MAX_INFERENCE_GAP_DAYS = 30
 
 
-# ============================================================
-# FILL TEMPORAL GAPS
-# ============================================================
+def build_gap_candidates(resolved_ranges):
 
-def fill_temporal_gaps(
-    resolved_ranges,
-    transition_anchors,
-):
+    # On préfère le score ajusté s'il existe
+    score_col = (
+        "adjusted_relative_score"
+        if "adjusted_relative_score" in resolved_ranges.columns
+        else "relative_score"
+    )
 
     w = (
         Window
         .partitionBy("entity_key")
-        .orderBy(
-            "range_from",
-            "range_to",
-            "range_id",
-        )
+        .orderBy("range_from", "range_to", "range_id")
     )
 
-    # --------------------------------------------------------
-    # 1. Trouver les trous entre ranges résolus
-    # --------------------------------------------------------
+    # -----------------------------------------
+    # 1. Trouver les observations avant/après
+    # -----------------------------------------
 
-    adj = (
+    gaps = (
         resolved_ranges
+
         .withColumn(
             "next_range_from",
             F.lead("range_from").over(w),
         )
         .withColumn(
-            "next_country_code",
+            "next_country",
             F.lead("country_code").over(w),
         )
         .withColumn(
-            "next_range_id",
-            F.lead("range_id").over(w),
+            "next_score",
+            F.lead(score_col).over(w),
         )
-    )
 
-    gaps = (
-        adj
         .where(
             F.col("next_range_from").isNotNull()
             & (F.col("range_to") < F.col("next_range_from"))
         )
+
         .select(
             "entity_key",
-            "person_id",
-
-            F.col("range_id").alias("left_range_id"),
-            F.col("next_range_id").alias("right_range_id"),
 
             F.col("range_to").alias("gap_from"),
             F.col("next_range_from").alias("gap_to"),
 
-            F.col("country_code").alias("country_before"),
-            F.col("next_country_code").alias("country_after"),
+            F.col("country_code").alias("left_country"),
+            F.col(score_col).alias("left_score"),
+
+            F.col("next_country").alias("right_country"),
+            F.col("next_score").alias("right_score"),
         )
+
         .withColumn(
-            "gap_seconds",
-            F.col("gap_to").cast("long")
-            - F.col("gap_from").cast("long"),
+            "gap_days",
+            F.datediff(
+                F.to_date("gap_to"),
+                F.to_date("gap_from"),
+            ),
         )
+
+        # On n'infère pas indéfiniment
+        .where(
+            F.col("gap_days")
+            <= F.lit(MAX_INFERENCE_GAP_DAYS)
+        )
+    )
+
+    # -----------------------------------------
+    # 2. Générer les jours du trou
+    # -----------------------------------------
+
+    days = (
+        gaps
+
         .withColumn(
-            "gap_id",
-            F.sha2(
-                F.concat_ws(
-                    "||",
-                    F.col("entity_key"),
-                    F.col("gap_from").cast("string"),
-                    F.col("gap_to").cast("string"),
+            "day",
+            F.explode(
+                F.sequence(
+                    F.to_date("gap_from"),
+                    F.to_date("gap_to"),
+                )
+            ),
+        )
+
+        .withColumn(
+            "distance_left_days",
+            F.greatest(
+                F.datediff(
+                    F.col("day"),
+                    F.to_date("gap_from"),
                 ),
-                256,
+                F.lit(0),
             ),
         )
-    )
 
-    # --------------------------------------------------------
-    # 2. Chercher transition explicite compatible
-    #
-    # FR ----- trou ----- DE
-    #
-    # On cherche :
-    # FR -> DE
-    # avec transition_ts dans le trou.
-    # --------------------------------------------------------
-
-    compatible_transitions = (
-        gaps.alias("g")
-        .join(
-            transition_anchors.alias("t"),
-            (
-                (F.col("g.entity_key") == F.col("t.entity_key"))
-                & (
-                    F.col("t.transition_ts")
-                    >= F.col("g.gap_from")
-                )
-                & (
-                    F.col("t.transition_ts")
-                    <= F.col("g.gap_to")
-                )
-                & (
-                    F.col("t.country_from")
-                    == F.col("g.country_before")
-                )
-                & (
-                    F.col("t.country_to")
-                    == F.col("g.country_after")
-                )
-            ),
-            "inner",
-        )
-        .select(
-            F.col("g.gap_id"),
-            F.col("t.silver_event_id")
-                .alias("transition_silver_event_id"),
-            F.col("t.transition_ts"),
-            F.col("t.evidence_weight")
-                .alias("transition_weight"),
-            F.col("t.evidence_count")
-                .alias("transition_evidence_count"),
-        )
-    )
-
-    # S'il y en a plusieurs, garder la plus forte
-    wt = (
-        Window
-        .partitionBy("gap_id")
-        .orderBy(
-            F.col("transition_weight").desc(),
-            F.col("transition_evidence_count").desc(),
-            F.col("transition_ts").asc(),
-        )
-    )
-
-    best_transition = (
-        compatible_transitions
         .withColumn(
-            "_rank",
-            F.row_number().over(wt),
+            "distance_right_days",
+            F.greatest(
+                F.datediff(
+                    F.to_date("gap_to"),
+                    F.col("day"),
+                ),
+                F.lit(0),
+            ),
         )
-        .where(F.col("_rank") == 1)
-        .drop("_rank")
+
+        .withColumn(
+            "left_influence",
+            F.col("left_score")
+            * F.exp(
+                -F.col("distance_left_days")
+                / F.lit(TIME_DECAY_DAYS)
+            ),
+        )
+
+        .withColumn(
+            "right_influence",
+            F.col("right_score")
+            * F.exp(
+                -F.col("distance_right_days")
+                / F.lit(TIME_DECAY_DAYS)
+            ),
+        )
     )
 
-    gaps = (
-        gaps
-        .join(
-            best_transition,
-            "gap_id",
-            "left",
-        )
-    )
+    # -----------------------------------------
+    # 3. Candidat venant de la gauche
+    # -----------------------------------------
 
-    # ========================================================
-    # 3. CAS A : FR ... TROU ... FR
-    #
-    # Continuité du même pays
-    # ========================================================
-
-    same_country_gaps = (
-        gaps
-        .where(
-            (F.col("country_before") == F.col("country_after"))
-            & (
-                F.col("gap_seconds")
-                <= F.lit(MAX_CONTINUITY_GAP_HOURS * 3600)
-            )
-        )
+    left = (
+        days
         .select(
-            "gap_id",
             "entity_key",
-            "person_id",
+            "day",
+            "gap_from",
+            "gap_to",
 
-            F.col("gap_from").alias("range_from"),
-            F.col("gap_to").alias("range_to"),
+            F.col("left_country").alias("country_code"),
+            F.col("left_influence").alias("inferred_score"),
 
-            F.col("country_before").alias("country_code"),
+            "distance_left_days",
+            "distance_right_days",
 
-            "left_range_id",
-            "right_range_id",
-        )
-        .withColumn(
-            "range_id",
-            F.concat(
-                F.lit("GAP_CONTINUITY_"),
-                F.col("gap_id"),
-            ),
-        )
-        .withColumn(
-            "result_type",
-            F.lit("INFERRED"),
-        )
-        .withColumn(
-            "resolution_method",
-            F.lit("SAME_COUNTRY_CONTINUITY"),
-        )
-        .withColumn(
-            "is_inferred",
-            F.lit(True),
+            "left_country",
+            "right_country",
         )
     )
 
-    # ========================================================
-    # 4. CAS B : FR ... TROU ... DE
-    #            transition FR -> DE à T
-    #
-    # Produit :
-    #
-    # gap_from -> T   FR
-    # T -> gap_to     DE
-    # ========================================================
+    # -----------------------------------------
+    # 4. Candidat venant de la droite
+    # -----------------------------------------
 
-    transition_gaps = (
-        gaps
-        .where(
-            (F.col("country_before") != F.col("country_after"))
-            & F.col("transition_ts").isNotNull()
-            & (
-                F.col("gap_seconds")
-                <= F.lit(
-                    MAX_TRANSITION_BRIDGE_GAP_HOURS * 3600
-                )
-            )
-        )
-    )
-
-    before_transition = (
-        transition_gaps
-        .where(
-            F.col("gap_from") < F.col("transition_ts")
-        )
+    right = (
+        days
         .select(
-            "gap_id",
             "entity_key",
-            "person_id",
+            "day",
+            "gap_from",
+            "gap_to",
 
-            F.col("gap_from").alias("range_from"),
-            F.col("transition_ts").alias("range_to"),
+            F.col("right_country").alias("country_code"),
+            F.col("right_influence").alias("inferred_score"),
 
-            F.col("country_before").alias("country_code"),
+            "distance_left_days",
+            "distance_right_days",
 
-            "left_range_id",
-            "right_range_id",
-
-            "transition_silver_event_id",
-            "transition_ts",
-            "transition_weight",
-        )
-        .withColumn(
-            "range_id",
-            F.concat(
-                F.lit("GAP_TRANSITION_BEFORE_"),
-                F.col("gap_id"),
-            ),
-        )
-        .withColumn(
-            "result_type",
-            F.lit("INFERRED"),
-        )
-        .withColumn(
-            "resolution_method",
-            F.lit("EXPLICIT_TRANSITION_BRIDGE"),
-        )
-        .withColumn(
-            "is_inferred",
-            F.lit(True),
+            "left_country",
+            "right_country",
         )
     )
 
-    after_transition = (
-        transition_gaps
-        .where(
-            F.col("transition_ts") < F.col("gap_to")
-        )
-        .select(
-            "gap_id",
-            "entity_key",
-            "person_id",
-
-            F.col("transition_ts").alias("range_from"),
-            F.col("gap_to").alias("range_to"),
-
-            F.col("country_after").alias("country_code"),
-
-            "left_range_id",
-            "right_range_id",
-
-            "transition_silver_event_id",
-            "transition_ts",
-            "transition_weight",
-        )
-        .withColumn(
-            "range_id",
-            F.concat(
-                F.lit("GAP_TRANSITION_AFTER_"),
-                F.col("gap_id"),
-            ),
-        )
-        .withColumn(
-            "result_type",
-            F.lit("INFERRED"),
-        )
-        .withColumn(
-            "resolution_method",
-            F.lit("EXPLICIT_TRANSITION_BRIDGE"),
-        )
-        .withColumn(
-            "is_inferred",
-            F.lit(True),
-        )
-    )
-
-    # ========================================================
-    # 5. CAS C : impossible de conclure
+    # -----------------------------------------
+    # 5. Fusionner
     #
-    # On garde explicitement le trou UNKNOWN
-    # ========================================================
+    # Si FR ... FR :
+    # les deux influences deviennent un seul
+    # candidat FR.
+    # -----------------------------------------
 
-    unknown_gaps = (
-        gaps
-        .where(
-            ~(
-                (
-                    (F.col("country_before") == F.col("country_after"))
-                    & (
-                        F.col("gap_seconds")
-                        <= F.lit(MAX_CONTINUITY_GAP_HOURS * 3600)
-                    )
-                )
-                |
-                (
-                    (F.col("country_before") != F.col("country_after"))
-                    & F.col("transition_ts").isNotNull()
-                    & (
-                        F.col("gap_seconds")
-                        <= F.lit(
-                            MAX_TRANSITION_BRIDGE_GAP_HOURS * 3600
-                        )
-                    )
-                )
-            )
-        )
-        .select(
-            "gap_id",
+    candidates = (
+        left
+        .unionByName(right)
+
+        .groupBy(
             "entity_key",
-            "person_id",
-
-            F.col("gap_from").alias("range_from"),
-            F.col("gap_to").alias("range_to"),
-
-            "left_range_id",
-            "right_range_id",
-        )
-        .withColumn(
+            "day",
+            "gap_from",
+            "gap_to",
             "country_code",
-            F.lit(None).cast("string"),
+            "left_country",
+            "right_country",
         )
+
+        .agg(
+            F.max("inferred_score").alias("inferred_score"),
+            F.min("distance_left_days").alias("distance_left_days"),
+            F.min("distance_right_days").alias("distance_right_days"),
+        )
+    )
+
+    # -----------------------------------------
+    # 6. Poids relatif entre les candidats
+    # -----------------------------------------
+
+    wc = Window.partitionBy(
+        "entity_key",
+        "day",
+        "gap_from",
+        "gap_to",
+    )
+
+    return (
+        candidates
+
         .withColumn(
-            "range_id",
-            F.concat(
-                F.lit("GAP_UNKNOWN_"),
-                F.col("gap_id"),
+            "total_inferred_score",
+            F.sum("inferred_score").over(wc),
+        )
+
+        .withColumn(
+            "candidate_share",
+            F.when(
+                F.col("total_inferred_score") > 0,
+                F.col("inferred_score")
+                / F.col("total_inferred_score"),
             ),
         )
+
         .withColumn(
             "result_type",
-            F.lit("UNKNOWN"),
+            F.lit("INFERRED"),
         )
+
         .withColumn(
             "resolution_method",
-            F.lit("UNRESOLVED_GAP"),
-        )
-        .withColumn(
-            "is_inferred",
-            F.lit(True),
+            F.lit("TEMPORAL_INTERPOLATION"),
         )
     )
-
-    # ========================================================
-    # 6. RANGES EXISTANTS
-    # ========================================================
-
-    observed = (
-        resolved_ranges
-        .withColumn(
-            "result_type",
-            F.lit("RESOLVED"),
-        )
-        .withColumn(
-            "is_inferred",
-            F.lit(False),
-        )
-    )
-
-    # ========================================================
-    # 7. TIMELINE COMPLETE
-    # ========================================================
-
-    resolved_timeline = (
-        observed
-        .unionByName(
-            same_country_gaps,
-            allowMissingColumns=True,
-        )
-        .unionByName(
-            before_transition,
-            allowMissingColumns=True,
-        )
-        .unionByName(
-            after_transition,
-            allowMissingColumns=True,
-        )
-        .unionByName(
-            unknown_gaps,
-            allowMissingColumns=True,
-        )
-        .orderBy(
-            "entity_key",
-            "range_from",
-            "range_to",
-        )
-    )
-
-    return resolved_timeline
