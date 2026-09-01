@@ -1,15 +1,22 @@
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+
 # ============================================================
-# NOUVEAU
-# Corrige uniquement les sauts isolés A -> B -> A.
-# On ne supprime B que si :
-#   - A existe aussi comme candidat sur cette range
-#   - B n'est pas fortement meilleur
-#   - aucune transition ne soutient B
+# CALIBRATION
 # ============================================================
 
-def smooth_isolated_jumps(
-    winners,
-    adjusted_candidates,
+MAX_CONTINUITY_GAP_HOURS = 72
+MAX_TRANSITION_BRIDGE_GAP_HOURS = 72
+
+
+# ============================================================
+# FILL TEMPORAL GAPS
+# ============================================================
+
+def fill_temporal_gaps(
+    resolved_ranges,
+    transition_anchors,
 ):
 
     w = (
@@ -22,280 +29,409 @@ def smooth_isolated_jumps(
         )
     )
 
-    x = (
-        winners
+    # --------------------------------------------------------
+    # 1. Trouver les trous entre ranges résolus
+    # --------------------------------------------------------
+
+    adj = (
+        resolved_ranges
         .withColumn(
-            "prev_country",
-            F.lag("country_code").over(w),
+            "next_range_from",
+            F.lead("range_from").over(w),
         )
         .withColumn(
-            "next_country",
+            "next_country_code",
             F.lead("country_code").over(w),
         )
         .withColumn(
-            "is_isolated_jump",
-            (
-                F.col("prev_country").isNotNull()
-                & (F.col("prev_country") == F.col("next_country"))
-                & (F.col("country_code") != F.col("prev_country"))
-            ),
+            "next_range_id",
+            F.lead("range_id").over(w),
         )
     )
 
-    # Chercher le pays A comme candidat alternatif
-    alternatives = (
-        x.where(F.col("is_isolated_jump"))
+    gaps = (
+        adj
+        .where(
+            F.col("next_range_from").isNotNull()
+            & (F.col("range_to") < F.col("next_range_from"))
+        )
         .select(
-            "range_id",
-            F.col("prev_country").alias("alternative_country"),
-        )
-        .join(
-            adjusted_candidates.select(
-                "range_id",
-                F.col("country_code").alias("alternative_country"),
-                F.col("evidence_score").alias("alt_evidence_score"),
-                F.col("relative_score").alias("alt_relative_score"),
-                F.col("adjusted_score").alias("alt_adjusted_score"),
-                F.col("candidate_rank").alias("alt_candidate_rank"),
-            ),
-            ["range_id", "alternative_country"],
-            "inner",
-        )
-    )
+            "entity_key",
+            "person_id",
 
-    x = (
-        x.join(
-            alternatives,
-            "range_id",
-            "left",
+            F.col("range_id").alias("left_range_id"),
+            F.col("next_range_id").alias("right_range_id"),
+
+            F.col("range_to").alias("gap_from"),
+            F.col("next_range_from").alias("gap_to"),
+
+            F.col("country_code").alias("country_before"),
+            F.col("next_country_code").alias("country_after"),
         )
         .withColumn(
-            "should_smooth",
-            F.col("is_isolated_jump")
-            & F.col("alt_adjusted_score").isNotNull()
-
-            # Une transition soutient le pays actuel :
-            # on ne le corrige pas.
-            & (F.col("transition_support") == 0)
-
-            # Le pays actuel ne domine pas suffisamment.
-            & (
-                (
-                    F.col("adjusted_score")
-                    - F.col("alt_adjusted_score")
-                )
-                <= F.lit(ISOLATED_JUMP_MIN_ADVANTAGE)
+            "gap_seconds",
+            F.col("gap_to").cast("long")
+            - F.col("gap_from").cast("long"),
+        )
+        .withColumn(
+            "gap_id",
+            F.sha2(
+                F.concat_ws(
+                    "||",
+                    F.col("entity_key"),
+                    F.col("gap_from").cast("string"),
+                    F.col("gap_to").cast("string"),
+                ),
+                256,
             ),
         )
+    )
 
+    # --------------------------------------------------------
+    # 2. Chercher transition explicite compatible
+    #
+    # FR ----- trou ----- DE
+    #
+    # On cherche :
+    # FR -> DE
+    # avec transition_ts dans le trou.
+    # --------------------------------------------------------
+
+    compatible_transitions = (
+        gaps.alias("g")
+        .join(
+            transition_anchors.alias("t"),
+            (
+                (F.col("g.entity_key") == F.col("t.entity_key"))
+                & (
+                    F.col("t.transition_ts")
+                    >= F.col("g.gap_from")
+                )
+                & (
+                    F.col("t.transition_ts")
+                    <= F.col("g.gap_to")
+                )
+                & (
+                    F.col("t.country_from")
+                    == F.col("g.country_before")
+                )
+                & (
+                    F.col("t.country_to")
+                    == F.col("g.country_after")
+                )
+            ),
+            "inner",
+        )
+        .select(
+            F.col("g.gap_id"),
+            F.col("t.silver_event_id")
+                .alias("transition_silver_event_id"),
+            F.col("t.transition_ts"),
+            F.col("t.evidence_weight")
+                .alias("transition_weight"),
+            F.col("t.evidence_count")
+                .alias("transition_evidence_count"),
+        )
+    )
+
+    # S'il y en a plusieurs, garder la plus forte
+    wt = (
+        Window
+        .partitionBy("gap_id")
+        .orderBy(
+            F.col("transition_weight").desc(),
+            F.col("transition_evidence_count").desc(),
+            F.col("transition_ts").asc(),
+        )
+    )
+
+    best_transition = (
+        compatible_transitions
+        .withColumn(
+            "_rank",
+            F.row_number().over(wt),
+        )
+        .where(F.col("_rank") == 1)
+        .drop("_rank")
+    )
+
+    gaps = (
+        gaps
+        .join(
+            best_transition,
+            "gap_id",
+            "left",
+        )
+    )
+
+    # ========================================================
+    # 3. CAS A : FR ... TROU ... FR
+    #
+    # Continuité du même pays
+    # ========================================================
+
+    same_country_gaps = (
+        gaps
+        .where(
+            (F.col("country_before") == F.col("country_after"))
+            & (
+                F.col("gap_seconds")
+                <= F.lit(MAX_CONTINUITY_GAP_HOURS * 3600)
+            )
+        )
+        .select(
+            "gap_id",
+            "entity_key",
+            "person_id",
+
+            F.col("gap_from").alias("range_from"),
+            F.col("gap_to").alias("range_to"),
+
+            F.col("country_before").alias("country_code"),
+
+            "left_range_id",
+            "right_range_id",
+        )
+        .withColumn(
+            "range_id",
+            F.concat(
+                F.lit("GAP_CONTINUITY_"),
+                F.col("gap_id"),
+            ),
+        )
+        .withColumn(
+            "result_type",
+            F.lit("INFERRED"),
+        )
+        .withColumn(
+            "resolution_method",
+            F.lit("SAME_COUNTRY_CONTINUITY"),
+        )
+        .withColumn(
+            "is_inferred",
+            F.lit(True),
+        )
+    )
+
+    # ========================================================
+    # 4. CAS B : FR ... TROU ... DE
+    #            transition FR -> DE à T
+    #
+    # Produit :
+    #
+    # gap_from -> T   FR
+    # T -> gap_to     DE
+    # ========================================================
+
+    transition_gaps = (
+        gaps
+        .where(
+            (F.col("country_before") != F.col("country_after"))
+            & F.col("transition_ts").isNotNull()
+            & (
+                F.col("gap_seconds")
+                <= F.lit(
+                    MAX_TRANSITION_BRIDGE_GAP_HOURS * 3600
+                )
+            )
+        )
+    )
+
+    before_transition = (
+        transition_gaps
+        .where(
+            F.col("gap_from") < F.col("transition_ts")
+        )
+        .select(
+            "gap_id",
+            "entity_key",
+            "person_id",
+
+            F.col("gap_from").alias("range_from"),
+            F.col("transition_ts").alias("range_to"),
+
+            F.col("country_before").alias("country_code"),
+
+            "left_range_id",
+            "right_range_id",
+
+            "transition_silver_event_id",
+            "transition_ts",
+            "transition_weight",
+        )
+        .withColumn(
+            "range_id",
+            F.concat(
+                F.lit("GAP_TRANSITION_BEFORE_"),
+                F.col("gap_id"),
+            ),
+        )
+        .withColumn(
+            "result_type",
+            F.lit("INFERRED"),
+        )
+        .withColumn(
+            "resolution_method",
+            F.lit("EXPLICIT_TRANSITION_BRIDGE"),
+        )
+        .withColumn(
+            "is_inferred",
+            F.lit(True),
+        )
+    )
+
+    after_transition = (
+        transition_gaps
+        .where(
+            F.col("transition_ts") < F.col("gap_to")
+        )
+        .select(
+            "gap_id",
+            "entity_key",
+            "person_id",
+
+            F.col("transition_ts").alias("range_from"),
+            F.col("gap_to").alias("range_to"),
+
+            F.col("country_after").alias("country_code"),
+
+            "left_range_id",
+            "right_range_id",
+
+            "transition_silver_event_id",
+            "transition_ts",
+            "transition_weight",
+        )
+        .withColumn(
+            "range_id",
+            F.concat(
+                F.lit("GAP_TRANSITION_AFTER_"),
+                F.col("gap_id"),
+            ),
+        )
+        .withColumn(
+            "result_type",
+            F.lit("INFERRED"),
+        )
+        .withColumn(
+            "resolution_method",
+            F.lit("EXPLICIT_TRANSITION_BRIDGE"),
+        )
+        .withColumn(
+            "is_inferred",
+            F.lit(True),
+        )
+    )
+
+    # ========================================================
+    # 5. CAS C : impossible de conclure
+    #
+    # On garde explicitement le trou UNKNOWN
+    # ========================================================
+
+    unknown_gaps = (
+        gaps
+        .where(
+            ~(
+                (
+                    (F.col("country_before") == F.col("country_after"))
+                    & (
+                        F.col("gap_seconds")
+                        <= F.lit(MAX_CONTINUITY_GAP_HOURS * 3600)
+                    )
+                )
+                |
+                (
+                    (F.col("country_before") != F.col("country_after"))
+                    & F.col("transition_ts").isNotNull()
+                    & (
+                        F.col("gap_seconds")
+                        <= F.lit(
+                            MAX_TRANSITION_BRIDGE_GAP_HOURS * 3600
+                        )
+                    )
+                )
+            )
+        )
+        .select(
+            "gap_id",
+            "entity_key",
+            "person_id",
+
+            F.col("gap_from").alias("range_from"),
+            F.col("gap_to").alias("range_to"),
+
+            "left_range_id",
+            "right_range_id",
+        )
         .withColumn(
             "country_code",
-            F.when(
-                F.col("should_smooth"),
-                F.col("alternative_country"),
-            ).otherwise(F.col("country_code")),
+            F.lit(None).cast("string"),
         )
-
         .withColumn(
-            "evidence_score",
-            F.when(
-                F.col("should_smooth"),
-                F.col("alt_evidence_score"),
-            ).otherwise(F.col("evidence_score")),
+            "range_id",
+            F.concat(
+                F.lit("GAP_UNKNOWN_"),
+                F.col("gap_id"),
+            ),
         )
-
         .withColumn(
-            "relative_score",
-            F.when(
-                F.col("should_smooth"),
-                F.col("alt_relative_score"),
-            ).otherwise(F.col("relative_score")),
+            "result_type",
+            F.lit("UNKNOWN"),
         )
-
-        .withColumn(
-            "adjusted_score",
-            F.when(
-                F.col("should_smooth"),
-                F.col("alt_adjusted_score"),
-            ).otherwise(F.col("adjusted_score")),
-        )
-
-        .withColumn(
-            "candidate_rank",
-            F.when(
-                F.col("should_smooth"),
-                F.col("alt_candidate_rank"),
-            ).otherwise(F.col("candidate_rank")),
-        )
-
         .withColumn(
             "resolution_method",
-            F.when(
-                F.col("should_smooth"),
-                F.lit("ISOLATED_JUMP_CORRECTION"),
-            ).otherwise(F.col("resolution_method")),
+            F.lit("UNRESOLVED_GAP"),
         )
-
-        .drop(
-            "prev_country",
-            "next_country",
-            "is_isolated_jump",
-            "alternative_country",
-            "alt_evidence_score",
-            "alt_relative_score",
-            "alt_adjusted_score",
-            "alt_candidate_rank",
-            "should_smooth",
+        .withColumn(
+            "is_inferred",
+            F.lit(True),
         )
     )
 
-    return x# ============================================================
-# MODIFICATION : nouveau temporal_engine simple
-# ============================================================
+    # ========================================================
+    # 6. RANGES EXISTANTS
+    # ========================================================
 
-def temporal_engine(stage1):
-
-    adjusted_candidates = apply_transition_support(
-        stage1["local_candidates"],
-        stage1["transition_anchors"],
+    observed = (
+        resolved_ranges
+        .withColumn(
+            "result_type",
+            F.lit("RESOLVED"),
+        )
+        .withColumn(
+            "is_inferred",
+            F.lit(False),
+        )
     )
 
-    local_winners = choose_local_winner(
-        adjusted_candidates
-    )
+    # ========================================================
+    # 7. TIMELINE COMPLETE
+    # ========================================================
 
-    resolved_ranges = smooth_isolated_jumps(
-        local_winners,
-        adjusted_candidates,
-    )
-
-    return {
-        "adjusted_candidates": adjusted_candidates,
-        "resolved_ranges": resolved_ranges,
-    }# ============================================================
-# NOUVEAU
-# On choisit le meilleur candidat APRES prise en compte
-# des transitions.
-# ============================================================
-
-def choose_local_winner(adjusted_candidates):
-
-    w = (
-        Window
-        .partitionBy("range_id")
+    resolved_timeline = (
+        observed
+        .unionByName(
+            same_country_gaps,
+            allowMissingColumns=True,
+        )
+        .unionByName(
+            before_transition,
+            allowMissingColumns=True,
+        )
+        .unionByName(
+            after_transition,
+            allowMissingColumns=True,
+        )
+        .unionByName(
+            unknown_gaps,
+            allowMissingColumns=True,
+        )
         .orderBy(
-            F.col("adjusted_score").desc(),
-            F.col("logic_count").desc(),
-            F.col("country_code").asc(),
+            "entity_key",
+            "range_from",
+            "range_to",
         )
     )
 
-    return (
-        adjusted_candidates
-        .withColumn(
-            "adjusted_rank",
-            F.row_number().over(w),
-        )
-        .where(F.col("adjusted_rank") == 1)
-        .withColumn(
-            "original_country_code",
-            F.col("country_code"),
-        )
-        .withColumn(
-            "resolution_method",
-            F.lit("LOCAL_WINNER"),
-        )
-    )# ============================================================
-# NOUVEAU
-# Les transitions renforcent directement les candidats locaux.
-# ============================================================
-
-def apply_transition_support(
-    local_candidates,
-    transition_anchors,
-):
-
-    c = local_candidates.alias("c")
-    t = transition_anchors.alias("t")
-
-    # Pays de départ : range immédiatement AVANT la transition
-    support_before = (
-        c.join(
-            t,
-            (
-                (F.col("c.entity_key") == F.col("t.entity_key"))
-                & (F.col("c.range_to") == F.col("t.transition_ts"))
-                & (F.col("c.country_code") == F.col("t.country_from"))
-            ),
-            "inner",
-        )
-        .select(
-            F.col("c.range_id").alias("range_id"),
-            F.col("c.country_code").alias("country_code"),
-            (
-                F.col("t.evidence_weight")
-                * F.lit(TRANSITION_FROM_BONUS)
-            ).alias("transition_support"),
-        )
-    )
-
-    # Pays d'arrivée : range immédiatement APRES la transition
-    support_after = (
-        c.join(
-            t,
-            (
-                (F.col("c.entity_key") == F.col("t.entity_key"))
-                & (F.col("c.range_from") == F.col("t.transition_ts"))
-                & (F.col("c.country_code") == F.col("t.country_to"))
-            ),
-            "inner",
-        )
-        .select(
-            F.col("c.range_id").alias("range_id"),
-            F.col("c.country_code").alias("country_code"),
-            (
-                F.col("t.evidence_weight")
-                * F.lit(TRANSITION_TO_BONUS)
-            ).alias("transition_support"),
-        )
-    )
-
-    support = (
-        support_before
-        .unionByName(support_after)
-        .groupBy("range_id", "country_code")
-        .agg(
-            F.sum("transition_support")
-            .alias("transition_support")
-        )
-    )
-
-    return (
-        local_candidates
-        .join(
-            support,
-            ["range_id", "country_code"],
-            "left",
-        )
-        .withColumn(
-            "transition_support",
-            F.coalesce(
-                F.col("transition_support"),
-                F.lit(0.0),
-            ),
-        )
-        .withColumn(
-            "adjusted_score",
-            F.col("evidence_score")
-            + F.col("transition_support"),
-        )
-    )# ============================================================
-# PARAMETRES TEMPORAL RESOLVER
-# ============================================================
-
-TRANSITION_FROM_BONUS = 0.50
-TRANSITION_TO_BONUS = 1.00
-
-# Un saut A -> B -> A est corrigé si B ne dépasse pas
-# le candidat A de plus de cette valeur.
-ISOLATED_JUMP_MIN_ADVANTAGE = 0.30
+    return resolved_timeline
