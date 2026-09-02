@@ -1,3 +1,16 @@
+from location_segments_v1 import build_location_segments
+
+temporal = temporal_engine(stage1)
+
+segment_outputs = build_location_segments(
+    filled_ranges=temporal["filled_ranges"],
+    gap_candidates=temporal["gap_candidates"],
+)
+
+location_segment = segment_outputs["location_segment"]
+
+
+
 """Construction de ``gold.location_segment`` au grain ``entity_key``.
 
 Entrées :
