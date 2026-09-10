@@ -1,0 +1,109 @@
+from pyspark.sql import functions as F, Window
+
+
+def find_impacted_ranges(impacts_df, old_gold_df):
+    """
+    impacts_df:
+      impact_id, entity_key, impact_from, impact_to
+
+    old_gold_df:
+      entity_key, segment_id, segment_start, segment_end
+    """
+
+    i = impacts_df.alias("i")
+    g = old_gold_df.alias("g")
+
+    same_entity = (
+        F.col("i.entity_key") == F.col("g.entity_key")
+    )
+
+    # Segments qui chevauchent directement la période impactée
+    overlapping = (
+        i.join(
+            g,
+            same_entity
+            & (F.col("g.segment_start") <= F.col("i.impact_to"))
+            & (F.col("g.segment_end") >= F.col("i.impact_from")),
+            "left"
+        )
+        .groupBy(
+            "i.impact_id",
+            "i.entity_key",
+            "i.impact_from",
+            "i.impact_to"
+        )
+        .agg(
+            F.min("g.segment_start").alias("overlap_start"),
+            F.max("g.segment_end").alias("overlap_end")
+        )
+    )
+
+    previous_window = (
+        Window
+        .partitionBy(F.col("i.impact_id"))
+        .orderBy(
+            F.col("g.segment_end").desc(),
+            F.col("g.segment_start").desc()
+        )
+    )
+
+    previous_segment = (
+        i.join(
+            g,
+            same_entity
+            & (F.col("g.segment_end") < F.col("i.impact_from")),
+            "left"
+        )
+        .withColumn("_rn", F.row_number().over(previous_window))
+        .filter(F.col("_rn") == 1)
+        .select(
+            F.col("i.impact_id").alias("impact_id"),
+            F.col("g.segment_start").alias("previous_start"),
+            F.col("g.segment_end").alias("previous_end")
+        )
+    )
+
+    next_window = (
+        Window
+        .partitionBy(F.col("i.impact_id"))
+        .orderBy(
+            F.col("g.segment_start").asc(),
+            F.col("g.segment_end").asc()
+        )
+    )
+
+    next_segment = (
+        i.join(
+            g,
+            same_entity
+            & (F.col("g.segment_start") > F.col("i.impact_to")),
+            "left"
+        )
+        .withColumn("_rn", F.row_number().over(next_window))
+        .filter(F.col("_rn") == 1)
+        .select(
+            F.col("i.impact_id").alias("impact_id"),
+            F.col("g.segment_start").alias("next_start"),
+            F.col("g.segment_end").alias("next_end")
+        )
+    )
+
+    return (
+        overlapping
+        .join(previous_segment, "impact_id", "left")
+        .join(next_segment, "impact_id", "left")
+        .select(
+            "impact_id",
+            "entity_key",
+            F.least(
+                "impact_from",
+                "overlap_start",
+                "previous_start"
+            ).alias("recompute_from"),
+            F.greatest(
+                "impact_to",
+                "overlap_end",
+                "next_end"
+            ).alias("recompute_to")
+        )
+    )
