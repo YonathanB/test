@@ -1,4 +1,223 @@
-# REMPLACER build_gap_candidates() PAR CETTE VERSION
+from pyspark.sql import functions as F
+
+
+def build_impacted_bounds(
+    spark,
+    silver_impacted_bounds,
+    gold_table
+):
+    """
+    Entrée :
+        entity_key
+        min_day     : minimum provenant de la Silver impactée
+        max_day     : maximum provenant de la Silver impactée
+        entity_bucket, si présent
+
+    Sortie :
+        silver_min_day / silver_max_day : bornes initiales
+        min_day / max_day               : bornes finales de recalcul
+        informations sur les segments voisins
+    """
+
+    gold_columns = spark.table(gold_table).columns
+
+    use_bucket = (
+        "entity_bucket" in silver_impacted_bounds.columns
+        and "entity_bucket" in gold_columns
+    )
+
+    key_columns = ["entity_key"]
+
+    if use_bucket:
+        key_columns.append("entity_bucket")
+
+    # Une seule plage Silver par entity_key
+    impacted = (
+        silver_impacted_bounds
+        .groupBy(*key_columns)
+        .agg(
+            F.min(F.col("min_day").cast("date"))
+            .alias("silver_min_day"),
+
+            F.max(F.col("max_day").cast("date"))
+            .alias("silver_max_day")
+        )
+    )
+
+    columns_to_read = [
+        "entity_key",
+        "segment_from",
+        "segment_to"
+    ]
+
+    if use_bucket:
+        columns_to_read.append("entity_bucket")
+
+    # On ne lit pas les détails lourds de la Gold.
+    gold = (
+        spark.table(gold_table)
+        .select(*columns_to_read)
+        .withColumn(
+            "segment_from",
+            F.col("segment_from").cast("date")
+        )
+        .withColumn(
+            "segment_to",
+            F.col("segment_to").cast("date")
+        )
+    )
+
+    # Pruning des buckets pour la Gold resolved.
+    if use_bucket:
+        touched_buckets = [
+            row["entity_bucket"]
+            for row in (
+                impacted
+                .select("entity_bucket")
+                .distinct()
+                .collect()
+            )
+        ]
+
+        gold = gold.where(
+            F.col("entity_bucket").isin(touched_buckets)
+        )
+
+    impacted_alias = impacted.alias("impacted")
+    gold_alias = gold.alias("gold")
+
+    join_condition = (
+        F.col("impacted.entity_key")
+        == F.col("gold.entity_key")
+    )
+
+    if use_bucket:
+        join_condition = (
+            join_condition
+            & (
+                F.col("impacted.entity_bucket")
+                == F.col("gold.entity_bucket")
+            )
+        )
+
+    joined = (
+        impacted_alias
+        .join(gold_alias, join_condition, "left")
+        .select(
+            *[
+                F.col(f"impacted.{column}").alias(column)
+                for column in key_columns
+            ],
+            F.col("impacted.silver_min_day"),
+            F.col("impacted.silver_max_day"),
+            F.col("gold.segment_from").alias("gold_from"),
+            F.col("gold.segment_to").alias("gold_to")
+        )
+    )
+
+    overlaps_silver_period = (
+        (F.col("gold_from") <= F.col("silver_max_day"))
+        & (F.col("gold_to") >= F.col("silver_min_day"))
+    )
+
+    bounds = (
+        joined
+        .groupBy(
+            *key_columns,
+            "silver_min_day",
+            "silver_max_day"
+        )
+        .agg(
+            # Segment immédiatement avant silver_min_day
+            F.max(
+                F.when(
+                    F.col("gold_to") < F.col("silver_min_day"),
+                    F.struct(
+                        F.col("gold_to").alias("sort_day"),
+                        F.col("gold_from").alias("segment_from"),
+                        F.col("gold_to").alias("segment_to")
+                    )
+                )
+            ).alias("previous_segment"),
+
+            # Segments qui chevauchent directement la période Silver
+            F.min(
+                F.when(
+                    overlaps_silver_period,
+                    F.col("gold_from")
+                )
+            ).alias("overlap_from"),
+
+            F.max(
+                F.when(
+                    overlaps_silver_period,
+                    F.col("gold_to")
+                )
+            ).alias("overlap_to"),
+
+            # Segment immédiatement après silver_max_day
+            F.min(
+                F.when(
+                    F.col("gold_from") > F.col("silver_max_day"),
+                    F.struct(
+                        F.col("gold_from").alias("sort_day"),
+                        F.col("gold_from").alias("segment_from"),
+                        F.col("gold_to").alias("segment_to")
+                    )
+                )
+            ).alias("next_segment")
+        )
+        .select(
+            *key_columns,
+            "silver_min_day",
+            "silver_max_day",
+
+            F.col("previous_segment.segment_from")
+            .alias("previous_segment_from"),
+
+            F.col("previous_segment.segment_to")
+            .alias("previous_segment_to"),
+
+            "overlap_from",
+            "overlap_to",
+
+            F.col("next_segment.segment_from")
+            .alias("next_segment_from"),
+
+            F.col("next_segment.segment_to")
+            .alias("next_segment_to")
+        )
+        .withColumn(
+            "min_day",
+            F.least(
+                F.col("silver_min_day"),
+                F.coalesce(
+                    F.col("previous_segment_from"),
+                    F.col("silver_min_day")
+                ),
+                F.coalesce(
+                    F.col("overlap_from"),
+                    F.col("silver_min_day")
+                )
+            )
+        )
+        .withColumn(
+            "max_day",
+            F.greatest(
+                F.col("silver_max_day"),
+                F.coalesce(
+                    F.col("overlap_to"),
+                    F.col("silver_max_day")
+                ),
+                F.coalesce(
+                    F.col("next_segment_to"),
+                    F.col("silver_max_day")
+                )
+            )
+        )
+    )
+
+    return bounds# REMPLACER build_gap_candidates() PAR CETTE VERSION
 
 def build_gap_candidates(
     unresolved_gaps: DataFrame,
