@@ -2,8 +2,10 @@
 
 Temps en fuseau commun; fins de presence exclusives, bornes egales = point.
 TRANSITION: valid_from=depart, valid_to=arrivee; un seul pays connu est accepte.
-Les deux scopes partent des observations brutes. Seuls les trous non couverts
-sont inferes; une presence concurrente ne raccourcit pas une duree observee.
+Les deux scopes partent des observations brutes. Les trous non couverts sont
+inferes; le scope ENTITY propose aussi la continuite entre observations du meme
+pays, meme en presence d'un pays concurrent. Le scoring les departage. Une
+presence concurrente ne raccourcit pas une duree observee.
 Un mois signifie ici 30 jours ecoules, configurable dans inference_levels.
 Les scores sont des soutiens heuristiques, pas des probabilites calibrees.
 
@@ -250,7 +252,7 @@ def _number_intervals(df, keys, id_column):
 
 
 def build_candidate_ranges(anchors, config=None):
-    """Remplir les trous de couverture, toutes observations du scope confondues."""
+    """Remplir les trous et proposer les continuites de pays au scope ENTITY."""
     config = config or ScoringConfig()
     points = anchors.groupBy(*KEYS, "ts").agg(
         F.max("known_end").alias("covered_end"), F.max(F.struct("base_score", "endpoint")).alias("_best"),
@@ -268,7 +270,25 @@ def build_candidate_ranges(anchors, config=None):
         (_seconds(F.col("end_ts")) - _seconds(F.col("start_ts"))) / 86400.).withColumn(
         "temporal_coefficient", _coefficient(F.col("gap_days"), config)).filter(F.col("temporal_coefficient").isNotNull())
     owners = anchors.select(*KEYS, F.col("known_end").alias("start_ts"), F.col("endpoint").alias("left_endpoint"), "is_resolved")
-    inf = gaps.join(owners, KEYS + ["start_ts"]).withColumn("country_code", F.col("left_endpoint.country_code")).withColumn(
+    # Une observation concurrente reste disponible pour le scoring du pont.
+    # epoch_key interdit un pont a travers une coupure de transition.
+    country_points = anchors.filter("scope_type = 'ENTITY'").groupBy(*KEYS, "country_code", "ts").agg(
+        F.max("known_end").alias("covered_end"),
+        F.max(F.struct("base_score", "endpoint")).alias("_best"))
+    country_order = Window.partitionBy(*KEYS, "country_code").orderBy("ts").rowsBetween(
+        Window.unboundedPreceding, -1)
+    bridges = country_points.withColumn("previous_end", F.max("covered_end").over(country_order)).filter(
+        F.col("previous_end").isNotNull() & (F.col("ts") > F.col("previous_end"))).select(
+        *KEYS, F.col("previous_end").alias("start_ts"), F.col("ts").alias("end_ts"),
+        F.col("_best.endpoint").alias("right_endpoint"), F.col("country_code").alias("_country"))
+    bridges = bridges.join(gaps.select(*KEYS, "start_ts", "end_ts"),
+        KEYS + ["start_ts", "end_ts"], "left_anti").withColumn("gap_days",
+        (_seconds(F.col("end_ts")) - _seconds(F.col("start_ts"))) / 86400.).withColumn(
+        "temporal_coefficient", _coefficient(F.col("gap_days"), config)).filter(
+        F.col("temporal_coefficient").isNotNull())
+    bridges = bridges.join(owners.withColumn("_country", F.col("left_endpoint.country_code")),
+        KEYS + ["start_ts", "_country"]).drop("_country")
+    inf = gaps.join(owners, KEYS + ["start_ts"]).unionByName(bridges).withColumn("country_code", F.col("left_endpoint.country_code")).withColumn(
         "inference_id", _hash(*[F.col(c) for c in KEYS + ["start_ts", "end_ts"]], F.col("left_endpoint.original_anchor_id"))).withColumn(
         "_identity", F.least(F.col("left_endpoint.identifier_confidence"), F.coalesce(
             F.col("right_endpoint.identifier_confidence"), F.col("left_endpoint.identifier_confidence")))).withColumn(
@@ -555,7 +575,11 @@ def build_cells(supports, aligned, journeys, config, guards=None):
     ).filter(F.col("cell_id").isNotNull()).drop("cut_id"), guards
 
 
-def score_cells(cells, supports, journeys, guards, config, stage=lambda df: df):
+def score_cells(cells, supports, journeys, guards, config, stage=lambda df: df, progress=None):
+    def notify(message):
+        if progress is not None:
+            progress(message)
+    notify("score_cells: construction des soutiens actifs")
     c, s = cells.alias("c"), supports.alias("s")
     interval = (F.col("s.start_ts") <= F.col("c.start_ts")) & (F.col("c.end_ts") <= F.col("s.end_ts")) & (F.col("s.end_ts") > F.col("s.start_ts"))
     before = (F.col("s.start_ts") < F.col("c.start_ts")) & (F.col("c.start_ts") <= F.col("s.end_ts"))
@@ -564,8 +588,9 @@ def score_cells(cells, supports, journeys, guards, config, stage=lambda df: df):
         F.col("c.phase") == F.when(F.col("s.anchor_kind") == "FROM", -1).otherwise(1))
     match = F.when(F.col("c.is_point"), equal | F.when(F.col("c.phase") == -1, before).otherwise(after)).otherwise(interval)
     active = stage(c.join(s, (F.col("c.entity_key") == F.col("s.entity_key")) & (F.col("c.epoch_key") == F.col("s.epoch_key")) & match).select(
-        *[F.col("c." + name) for name in cells.columns], *[F.col("s." + name) for name in [
-            "country_code", "source_name", "source_group", "event_id", "support_score", "support_type", "support_id"]]))
+        F.col("c.cell_id"), *[F.col("s." + name) for name in [
+            "country_code", "source_name", "source_group", "event_id", "support_score", "support_type"]]))
+    notify("score_cells: construction des scores par source et pays")
     source = active.groupBy("cell_id", "country_code", "source_group").agg(
         F.max("support_score").alias("source_score"), F.collect_set("source_name").alias("source_names"),
         F.collect_set("event_id").alias("event_ids"), F.collect_set("support_type").alias("support_types"))
@@ -585,6 +610,7 @@ def score_cells(cells, supports, journeys, guards, config, stage=lambda df: df):
     ).withColumn("score", F.greatest("base_country_score", F.when(
         F.size("_qualified") >= 2, F.col("_m") + config.convergence_strength * (1 - F.col("_m")) * (1 - F.col("_product"))))
     ).withColumn("convergence_bonus", F.col("score") - F.col("base_country_score")).drop("_qualified", "_m", "_product")
+    notify("score_cells: construction du contexte temporel")
     c = cells.alias("c")
     # Un horaire prevu seul ne doit pas interdire une presence observee.
     j = journeys.filter((F.col("arrival_ts") > F.col("departure_ts")) & (
@@ -621,9 +647,11 @@ def score_cells(cells, supports, journeys, guards, config, stage=lambda df: df):
         "in_transit", F.coalesce((F.size("journey_ids") > 0) & F.lit(config.block_transit), F.lit(False))).withColumn(
         "guard_conflict", F.coalesce(F.size("guard_countries") > 1, F.lit(False))).withColumn(
         "guard_country", F.when(F.size("guard_countries") == 1, F.col("guard_countries")[0])))
+    notify("score_cells: construction des scores eligibles")
     scored = stage(country.join(context, "cell_id").withColumn("eligible",
         ~F.col("in_transit") & ~F.col("guard_conflict") & (
             F.col("guard_country").isNull() | (F.col("guard_country") == F.col("country_code")))))
+    notify("score_cells: construction des decisions")
     ranked = scored.filter("eligible").withColumn("rank", F.row_number().over(
         Window.partitionBy("cell_id").orderBy(F.desc("score"), "country_code")))
     winners = ranked.groupBy("cell_id").agg(
@@ -638,6 +666,7 @@ def score_cells(cells, supports, journeys, guards, config, stage=lambda df: df):
         .when(F.col("best_score") < config.minimum_score, "INSUFFICIENT_SCORE")
         .when(F.col("second_score").isNotNull() & (F.col("margin") < config.ambiguity_margin - 1e-12), "AMBIGUOUS").otherwise("PRINCIPAL")
     ).withColumn("selected_country", F.when(F.col("decision") == "PRINCIPAL", F.col("best_country"))))
+    notify("score_cells: construction des alternatives locales")
     local = scored.join(decisions.select("cell_id", "decision", "selected_country", "margin"), "cell_id").withColumn(
         "status", F.when(F.col("in_transit"), "ALTERNATIVE_IN_TRANSIT")
         .when(~F.col("eligible"), "TRANSITION_INCOMPATIBLE")
@@ -667,6 +696,117 @@ def summarize_periods(decisions, principal=True):
         out = numbered.groupBy(*groups).agg(
             F.min("start_ts").alias("start_ts"), F.max("end_ts").alias("end_ts"), F.collect_set("cell_id").alias("cell_ids"))
     return out.drop("_number")
+
+
+def build_travel_timeline(result):
+    """Chronologie lisible des decisions et des transitions conservees.
+
+    Utilisable sur un TravelRangesResult deja calcule: aucun scoring relance.
+    PRESENCE = sejour retenu, POINT = point retenu, TRANSITION = evenement
+    de transition, UNRESOLVED = abstention hors transport. Les transitions
+    sont du contexte source; le moteur ne choisit pas une transition gagnante.
+    decision=TRANSITION_CONTEXT rend ce role explicite, y compris les horaires.
+    Une transition n'est jamais transformee en presence de duree positive.
+
+    score_basis distingue la moyenne d'un sejour, le score d'un point et
+    le score de base d'une transition. Les scores ne sont pas des probabilites.
+    IN_TRANSIT est represente par les voyages, pas par une seconde ligne inconnue.
+    Les transitions partielles et les horaires rapproches sont preserves.
+    Les ruptures, epochs et choix du moteur sont conserves. Une succession de
+    lignes du meme pays ne suffit pas a prouver la continuite entre ces lignes.
+    La sortie masque phase, utilisee uniquement pour ordonner les bornes.
+    Aucune action Spark (count/collect/checkpoint) n'est ajoutee par cette fonction.
+    """
+    if result.principal_segments is None or result.decisions is None:
+        raise ValueError("build_travel_timeline exige un resultat avec score=True")
+
+    null_text = F.lit(None).cast("string")
+    null_score = F.lit(None).cast("double")
+    null_sources = F.lit(None).cast("array<string>")
+    columns = ["entity_key", "record_type", "start_ts", "end_ts", "country_code",
+               "country_from", "country_to", "score", "score_basis", "decision",
+               "transition_nature", "source_names", "reference_ids", "_order"]
+
+    stays = result.principal_segments.select(
+        "entity_key", F.lit("PRESENCE").alias("record_type"), "start_ts", "end_ts", "country_code",
+        null_text.alias("country_from"), null_text.alias("country_to"),
+        F.col("score_mean").alias("score"), F.lit("DURATION_WEIGHTED_COUNTRY_SCORE").alias("score_basis"),
+        F.lit("PRINCIPAL").alias("decision"), null_text.alias("transition_nature"),
+        F.col("sources").alias("source_names"), F.array("segment_id").alias("reference_ids"),
+        F.lit(3).alias("_order"))
+    points = result.principal_points.select(
+        "entity_key", F.lit("POINT").alias("record_type"), F.col("ts").alias("start_ts"),
+        F.col("ts").alias("end_ts"), "country_code", null_text.alias("country_from"),
+        null_text.alias("country_to"), "score", F.lit("POINT_COUNTRY_SCORE").alias("score_basis"),
+        F.lit("PRINCIPAL").alias("decision"), null_text.alias("transition_nature"),
+        F.col("sources").alias("source_names"), F.array("cell_id").alias("reference_ids"),
+        F.when(F.col("phase") == -1, 0).otherwise(2).alias("_order"))
+    full = result.journeys.select(
+        "entity_key", F.lit("TRANSITION").alias("record_type"),
+        F.col("departure_ts").alias("start_ts"), F.col("arrival_ts").alias("end_ts"),
+        null_text.alias("country_code"), "country_from", "country_to",
+        F.col("base_score").alias("score"), F.lit("TRANSITION_BASE_SCORE").alias("score_basis"),
+        F.lit("TRANSITION_CONTEXT").alias("decision"), "transition_nature",
+        F.array("source_name").alias("source_names"), F.array("event_id").alias("reference_ids"),
+        F.lit(1).alias("_order"))
+
+    partial = result.events.filter((F.col("event_type") == "TRANSITION")
+        & (F.col("country_from").isNull() | F.col("country_to").isNull()))
+    # Les scopes peuvent dupliquer une ancre. Le meme event_id reste une seule
+    # transition; ts contient l'heure effective apres rapprochement.
+    boundary_times = result.anchors.filter(F.col("anchor_kind").isin("FROM", "TO")).groupBy(
+        "entity_key", "event_id").agg(F.min("ts").alias("boundary_ts"))
+    partial = partial.join(boundary_times, ["entity_key", "event_id"], "left").withColumn(
+        "boundary_ts", F.coalesce("boundary_ts", F.when(F.col("country_from").isNotNull(),
+            F.col("valid_from")).otherwise(F.col("valid_to"))))
+    partial = partial.select(
+        "entity_key", F.lit("TRANSITION").alias("record_type"),
+        F.col("boundary_ts").alias("start_ts"), F.col("boundary_ts").alias("end_ts"),
+        null_text.alias("country_code"), "country_from", "country_to",
+        F.col("base_score").alias("score"), F.lit("TRANSITION_BASE_SCORE").alias("score_basis"),
+        F.lit("TRANSITION_CONTEXT").alias("decision"), "transition_nature",
+        F.array("source_name").alias("source_names"), F.array("event_id").alias("reference_ids"),
+        F.lit(1).alias("_order"))
+    unknown = result.unresolved_periods.filter(F.col("decision") != "IN_TRANSIT").select(
+        "entity_key", F.lit("UNRESOLVED").alias("record_type"), "start_ts", "end_ts",
+        null_text.alias("country_code"), null_text.alias("country_from"), null_text.alias("country_to"),
+        null_score.alias("score"), null_text.alias("score_basis"), "decision",
+        null_text.alias("transition_nature"), null_sources.alias("source_names"),
+        F.col("cell_ids").alias("reference_ids"), F.lit(3).alias("_order"))
+    unknown_points = result.unresolved_points.filter(F.col("decision") != "IN_TRANSIT").select(
+        "entity_key", F.lit("UNRESOLVED").alias("record_type"), "start_ts", "end_ts",
+        null_text.alias("country_code"), null_text.alias("country_from"), null_text.alias("country_to"),
+        null_score.alias("score"), null_text.alias("score_basis"), "decision",
+        null_text.alias("transition_nature"), null_sources.alias("source_names"),
+        F.array("cell_id").alias("reference_ids"),
+        F.when(F.col("phase") == -1, 0).otherwise(2).alias("_order"))
+    out = stays.select(*columns)
+    for frame in (points, full, partial, unknown, unknown_points):
+        out = out.unionByName(frame.select(*columns))
+    return out.orderBy("entity_key", "start_ts", "_order", "end_ts", "record_type").drop("_order")
+
+
+def summarize_unresolved(result):
+    """Motifs d'abstention par entite, avec nombre de periodes/points et duree.
+
+    IN_TRANSIT signifie transport, et non manque de preuve. Les periodes sont
+    comptees apres regroupement par epoch; les heures mesurent leur importance.
+    Une ligne par entity_key/decision, sans collect ni action Spark implicite.
+    """
+    if result.unresolved_periods is None:
+        raise ValueError("summarize_unresolved exige un resultat avec score=True")
+    periods = result.unresolved_periods.select(
+        "entity_key", "decision", F.lit(1).cast("long").alias("period_count"),
+        F.lit(0).cast("long").alias("point_count"),
+        ((_seconds(F.col("end_ts")) - _seconds(F.col("start_ts"))) / 3600.).alias("hours"))
+    points = result.unresolved_points.select(
+        "entity_key", "decision", F.lit(0).cast("long").alias("period_count"),
+        F.lit(1).cast("long").alias("point_count"), F.lit(0.).alias("hours"))
+    return periods.unionByName(points).groupBy("entity_key", "decision").agg(
+        F.sum("period_count").alias("period_count"), F.sum("point_count").alias("point_count"),
+        F.sum("hours").alias("hours")).withColumn(
+        "category", F.when(F.col("decision") == "IN_TRANSIT", "TRANSPORT").otherwise("ABSTENTION")
+    ).orderBy("entity_key", F.desc("hours"), "decision")
 
 
 @dataclass
@@ -702,7 +842,8 @@ class TravelRangesResult:
 
 
 def build_travel_ranges(silver, persist_intermediates=False, config=None,
-                        score=True, materialize_intermediates=False, checkpoint_dir=None):
+                        score=True, materialize_intermediates=False, checkpoint_dir=None,
+                        verbose=False):
     """Retourner candidats, preuves, scoring par tranche et parcours principal.
 
     score=False autorise un schema sans scores (construction seule).
@@ -716,6 +857,8 @@ def build_travel_ranges(silver, persist_intermediates=False, config=None,
     les observations voisines necessaires au scope, pas uniquement le mois.
     transition_guards/arrival_corroborations expliquent la priorite temporelle;
     local_scores conserve les scores bruts et les observations concurrentes.
+    verbose=True affiche la construction et les bornes de chaque checkpoint/cache,
+    sans collect, comptage supplementaire ni affichage du plan ou des donnees.
     """
     config = config or ScoringConfig()
     context = silver.sparkSession.sparkContext
@@ -725,25 +868,44 @@ def build_travel_ranges(silver, persist_intermediates=False, config=None,
     if score and not use_checkpoint:
         raise ValueError("Le scoring exige checkpoint_dir ou SparkContext.setCheckpointDir(...); "
                          "utiliser un chemin partage par les executors pour limiter la taille des plans.")
+    def notify(message):
+        if verbose:
+            print("[travel] " + message, flush=True)
+    notify("demarrage; Spark " + silver.sparkSession.version)
     persisted = []
-    def stage(df):
+    stage_index = 0
+    def stage(df, label="score_cells"):
+        nonlocal stage_index
+        stage_index += 1
+        prefix = str(stage_index) + " " + label
         if use_checkpoint:
+            notify(prefix + ": checkpoint DEBUT")
             df = df.checkpoint(eager=True)
+            notify(prefix + ": checkpoint FIN")
         if persist_intermediates or materialize_intermediates:
+            notify(prefix + ": persist DISK_ONLY")
             df = df.persist(StorageLevel.DISK_ONLY)
             persisted.append(df)
             if materialize_intermediates:
+                notify(prefix + ": materialisation du cache DEBUT")
                 df.count()
+                notify(prefix + ": materialisation du cache FIN")
         return df
+    notify("prepare_events: construction")
     events, rejected = prepare_events(silver, config, require_scores=score)
-    events = stage(events)
+    events = stage(events, "events")
+    notify("reconcile_transitions: construction")
     aligned, journeys, matches = reconcile_transitions(events, config)
-    aligned, journeys = stage(aligned), stage(journeys)
-    anchors = stage(build_scoped_anchors(events, aligned))
+    aligned, journeys = stage(aligned, "aligned"), stage(journeys, "journeys")
+    notify("build_scoped_anchors: construction")
+    anchors = stage(build_scoped_anchors(events, aligned), "anchors")
+    notify("build_candidate_ranges: construction")
     candidates, inferences, members = build_candidate_ranges(anchors, config)
-    candidates, inferences = stage(candidates), stage(inferences)
+    candidates, inferences = stage(candidates, "candidates"), stage(inferences, "inferences")
+    notify("merge_country_ranges: construction")
     ranges, links = merge_country_ranges(candidates)
-    ranges = stage(ranges)
+    ranges = stage(ranges, "ranges")
+    notify("attach_evidences: construction")
     evidences = attach_evidences(ranges, events, anchors, aligned)
     summary = evidences.groupBy("range_id").agg(
         F.countDistinct("event_id").alias("evidence_event_count"),
@@ -753,20 +915,25 @@ def build_travel_ranges(silver, persist_intermediates=False, config=None,
         links.select("range_id", "candidate_id").join(inferences, "candidate_id"),
         evidences, summary, journeys, matches, _persisted=persisted)
     if score:
-        supports = stage(build_scoring_supports(anchors, inferences))
+        notify("build_scoring_supports: construction")
+        supports = stage(build_scoring_supports(anchors, inferences), "scoring_supports")
+        notify("build_transition_guards: construction")
         guards, corroborations = build_transition_guards(anchors, config)
-        guards = stage(guards)
+        guards = stage(guards, "transition_guards")
         result.transition_guards, result.arrival_corroborations = guards, corroborations
+        notify("build_cells: construction")
         cells, guards = build_cells(supports, aligned, journeys, config, guards=guards)
-        cells = stage(cells)
-        local, decisions, source = score_cells(cells, supports, journeys, guards, config, stage)
+        cells = stage(cells, "cells")
+        local, decisions, source = score_cells(cells, supports, journeys, guards, config, stage, progress=notify)
         result.scoring_supports, result.local_scores, result.source_scores, result.decisions = supports, local, source, decisions
+        notify("summarize_periods: construction des sorties finales")
         result.principal_segments = summarize_periods(decisions)
         result.principal_points = decisions.filter(F.col("is_point") & (F.col("decision") == "PRINCIPAL")).select(
             "entity_key", "epoch_key", F.col("selected_country").alias("country_code"), F.col("start_ts").alias("ts"),
             "phase", F.col("best_score").alias("score"), F.col("winning_sources").alias("sources"), "cell_id")
         result.unresolved_periods = summarize_periods(decisions, principal=False)
         result.unresolved_points = decisions.filter(F.col("is_point") & (F.col("decision") != "PRINCIPAL"))
+    notify("construction terminee; les sorties finales sont disponibles pour les actions Spark")
     return result
 
 
